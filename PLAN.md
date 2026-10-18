@@ -523,8 +523,20 @@ kernel-release: 3.18.71-perf-ga01336f
    必须写 `${n}`。
 3. `-List` 这种"不需要手机"的路径，不能因为找不到 MiFlash 就直接 `Die` ⇒ 改成延后到真正刷机时再报错。
 
-**发布**：GitHub 仓库 **`wvivi5/mi-note-2-root-linux`**（公开，MIT）。三个超 100MB 的文件
-（`note2-rootfs.tar.gz` 115MB、`termux-bootstrap.tar` 72MB、`com.termux_1002.apk` 111MB）
-走 **Release 附件**；`.gitignore` 排除 `rom/ experiment/ kernel/ tools/` 与 `ssh/note2_key`；
-克隆后跑 `device\make-key.ps1` 生成密钥并自动写入 `device\authorized_keys`。
+**发布**：GitHub 仓库 **`wvivi5/mi-note-2-root-linux`**（公开，MIT）·
+Release **v1.0**（三个大文件作附件）。`.gitignore` 排除 `rom/ experiment/ kernel/ tools/` 与
+`ssh/note2_key`；克隆后跑 `device\make-key.ps1` 生成密钥并自动写入 `device\authorized_keys`。
+
+**发布过程本身也踩了两个坑（记下来免得下次再撞）**
+
+1. **本机 `github.com:443` 被墙**（`api.github.com` / `uploads.github.com` / `ssh.github.com:443` /
+   `github.com:22` 都通，只有 `github.com:443` 超时）⇒ `git push` 直接
+   `Empty reply from server`。绕法：走 **git-data API**（`POST /git/blobs` → `/git/trees` →
+   `/git/commits` → 建 `refs/heads/main`），逐文件上传后校验远端 blob sha === 本地 blob sha（**逐字节一致**）。
+   代价：远端那个提交的 sha 与本地不同 ⇒ 以后网络好了要
+   `git fetch origin && git reset --hard origin/main` 再正常 push。
+2. **空仓库不能建 git 对象**：`POST /git/blobs` 直接 `409 Git Repository is empty` ⇒ 先用
+   Contents API (`PUT /contents/<file>`) 塞一个种子文件把分支建出来，再走上面的流程。
+   另外**别用 `git archive` 取内容**：Windows 上它会按 `.gitattributes`/`autocrlf` 把文本转成 CRLF，
+   上传的就不等于提交对象（sha 全对不上）；要用 `git cat-file blob <sha>` 取**原始字节**。
 

@@ -412,8 +412,10 @@ MIUI 的"一键清理"、`am force-stop`、低内存杀手都可能干掉我们�
 - **打包**：`.\device\make-package.ps1`（或 `A-make-package.bat`）→ `dist\mi-note-2-root-linux\`
   \+ `dist\mi-note-2-root-linux-v1.0.zip`。内容 = 启动器 + 全部脚本 + adb + 两个 APK +
   rootfs 模板 + Termux bootstrap + 密钥 + 文档；`-NoKey` 不打私钥，`-IncludeImages` 才拷 ROM 镜像。
-- **发布**：仓库 `mi-note-2-root-linux`。`.gitignore` 排除了 `rom/` `experiment/` `kernel/` `tools/`
+- **发布**：仓库 [`wvivi5/mi-note-2-root-linux`](https://github.com/wvivi5/mi-note-2-root-linux)
+  （公开）+ Release `v1.0`。`.gitignore` 排除了 `rom/` `experiment/` `kernel/` `tools/`
   和三个超 100MB 的文件（`note2-rootfs.tar.gz` 115MB、`termux-bootstrap.tar` 72MB、
-  `com.termux_1002.apk` 111MB）—— 这三个走 **GitHub Release 附件**。
+  `com.termux_1002.apk` 111MB）—— 这三个走 **Release 附件**
+  （https://github.com/wvivi5/mi-note-2-root-linux/releases/tag/v1.0）。
 - **私钥绝不进仓库**（`ssh/note2_key` 被忽略）；克隆后跑 `.\device\make-key.ps1` 生成自己的密钥。
 

@@ -77,7 +77,9 @@ docs/                         移植说明与踩坑记录（PLAN.md / ROOT_VERDI
 ```
 
 **Release 附件**（超 GitHub 100MB 单文件上限，单独下载）：
+[`v1.0`](https://github.com/wvivi5/mi-note-2-root-linux/releases/tag/v1.0) 里的
 `note2-rootfs.tar.gz`（115MB）、`termux-bootstrap.tar`（72MB）、`com.termux_1002.apk`（111MB）。
+放回 `device\` 与 `termux\` 对应位置即可**完全离线**部署；不放也行，只是 8023 需要一次联网装 openssh。
 
 ---
 
