@@ -1,0 +1,4 @@
+#!/system/bin/sh
+# modprobe_path target used during provisioning: the kernel runs this file as
+# root (via request_module) -> provisioning step 1.
+exec /data/local/tmp/n2stage/p1.sh "$@"
