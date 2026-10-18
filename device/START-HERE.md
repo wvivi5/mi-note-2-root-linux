@@ -42,6 +42,7 @@
 | `8-flash-edl.bat` | EDL(9008) 深刷统一开发版 9.8.29 | 短接进 9008 + MiFlash 工具 |
 | `9-export-logs.bat` | 把 boot.log / 看门狗日志等导出到 `logs\` 下 | USB + adb |
 | `A-make-package.bat` | 重新打包这个文件夹（改完脚本后用） | 无 |
+| `B-publish.bat` | 发布/更新到 GitHub（`git push` 被墙时走 REST API） | `gh` 已登录 |
 
 > 每个 `.bat` 都是双击运行、跑完 `pause` 停住；需要输入的直接在窗口里敲。
 
