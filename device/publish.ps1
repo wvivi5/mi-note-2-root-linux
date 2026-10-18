@@ -74,8 +74,10 @@ if (-not $tok) { Die 'gh is not authenticated (run: gh auth login)' }
 $api = "https://api.github.com/repos/$Repo"
 $H = @{ Authorization = "token $tok"; 'User-Agent' = 'note2-publish'; Accept = 'application/vnd.github+json' }
 function Api($url, $obj, [string]$method = 'Post') {
+    $H2 = $H
+    if ($null -eq $obj) { return Invoke-RestMethod -Uri $url -Method $method -Headers $H2 }
     $bytes = [Text.Encoding]::UTF8.GetBytes(($obj | ConvertTo-Json -Depth 8 -Compress))
-    return Invoke-RestMethod -Uri $url -Method $method -Headers $H -Body $bytes -ContentType 'application/json; charset=utf-8'
+    return Invoke-RestMethod -Uri $url -Method $method -Headers $H2 -Body $bytes -ContentType 'application/json; charset=utf-8'
 }
 
 & gh repo view $Repo 2>&1 | Out-Null
@@ -87,8 +89,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # The git-data API refuses to work before the repository has any commit.
-& gh api "repos/$Repo/git/trees/$Branch" 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
+$empty = $false
+try { Api "$api/git/trees/$Branch" $null 'Get' | Out-Null } catch { $empty = $true }
+if ($empty) {
     Say 'empty repository - seeding the branch'
     $seedName = '.gitattributes'
     $seed = if (Test-Path $seedName) { $seedName } else { 'README.md' }
@@ -123,8 +126,14 @@ Api $api @{ default_branch = $Branch } 'Patch' | Out-Null
 Ok "commit $($c.sha) on $Branch"
 
 # ---------------------------------------------------------------- 5. verify
-Start-Sleep -Seconds 4
-$rem = & gh api "repos/$Repo/git/trees/$Branch?recursive=1" 2>$null | ConvertFrom-Json
+# Right after the ref moves, GitHub can briefly answer 404 for lookups by branch
+# name (replication lag), so read the tree back by commit sha and retry.
+$rem = $null
+for ($t = 1; $t -le 5; $t++) {
+    try { $rem = Api "$api/git/trees/$($c.sha)?recursive=1" $null 'Get'; break }
+    catch { Info "verification not ready yet (try $t) - waiting"; Start-Sleep -Seconds 5 }
+}
+if (-not $rem) { Die 'could not read the new tree back from GitHub' }
 $files = @($rem.tree | Where-Object { $_.type -eq 'blob' })
 $bad = @()
 foreach ($e in $entries) {
