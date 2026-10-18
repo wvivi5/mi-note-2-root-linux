@@ -166,7 +166,7 @@ for p in $(pgrep -x sshd); do cat /proc/$p/oom_score_adj; done   # 正常都是 
 | `collect-info.ps1` | PC | **上链前的体检**：逐台读 model/build/补丁级别/内核 `uname -r` 与 `/proc/version`，判定内核是否匹配 exploit 地址表（`-Csv` 可导出） |
 | `rerun.ps1` | PC | 改完载荷后**免重启**重新触发一次 root 链（随机不可打印 magic，见 §6） |
 | `00-startup.sh` | App | Termux:Boot 钩子：自愈式铺文件 + 起 8023 + **内核守卫** + 跑 root 链 → 8022 |
-| `boot_root_payload.sh` | **root** | root 载荷（部署为 `$HOME/n2/rootcmd.sh`）：解包/挂载 Ubuntu rootfs、设 root 密码、起 8022 sshd、起看门狗、刷新开机钩子、导出日志 |
+| `boot_root_payload.sh` | **root** | root 载荷（部署为 `$HOME/n2/rootcmd.sh`）：解包/挂载 Ubuntu rootfs、设 root 密码、起 8022 sshd、起看门狗、刷新开机钩子、导出日志、**切 USB host 模式并拉起有线网卡守护（§USB 有线网卡）** |
 | `p1.sh` | **root** | 部署期 stage-1：解包 Termux bootstrap、装开机钩子、拉起 p2wrap |
 | `p2wrap.sh` | **root** | 部署期 stage-2 包装：drop 到 App 身份跑 `p2.sh`，然后 `restorecon` |
 | `p2.sh` | App | `pkg install openssh` + 把 sshd 端口改成 8023 |
@@ -213,6 +213,57 @@ for p in $(pgrep -x sshd); do cat /proc/$p/oom_score_adj; done   # 正常都是 
 它会把最终使用的完整 `ssh` 命令打印出来，直接复制到别的终端也能用
 （forward 会刻意留着，拔线才失效）。`-ForceAdb` 可强制走第 3 条（模拟无网机器），
 `-Command '...'` 非交互执行一条，`-DryRun` 只看它选了哪条路。
+
+### USB 有线网卡（OTG 网口）—— WiFi 坏掉的机器靠它联网
+
+**结论先给**：这台机器插 USB 网卡，**必须由我们软件把 USB 口切到 host 模式**
+（写 `/sys/devices/soc/6a00000.ssusb/mode` = `host`）。MIUI 自己永远不会切 ——
+这个口没有 OTG ID 检测。切过去之后，**Android 自己的以太网服务会给 `eth0` 做 DHCP**，
+我们不用配 IP（netd 里能看到 `default via <网关> dev eth0 table 1031`）。
+
+**只认这些芯片**（驱动编在内核里；`/system/lib/modules` 只有 14 个 ko，**不能 insmod 补驱动**）：
+
+| 芯片 | 内核驱动 | 结果 |
+|---|---|---|
+| ASIX AX88772 / AX88172（含 **Apple USB Ethernet Adapter**，实测 `VID_05AC&PID_1402`） | `asix` | ✅ 实测稳，100M |
+| ASIX AX88179 / AX88178（USB3 千兆） | `ax88179_178a` | ✅ 内核支持 |
+| CDC-ECM（`bInterfaceClass=02 SubClass=06`，如 SZNX.10/100） | `cdc_ether` | ⚠️ 能认，但手里那块廉价卡会自己掉线（`-71/-110`、偶尔枚举成 `usb-storage`） |
+| CDC-NCM | `cdc_ncm` | ✅ 内核支持 |
+| **RTL8152 / 8153 / 8156（绿联这类最常见的）** | 需要 `r8152` | ❌ 内核**没有**这个驱动 |
+| RNDIS（手机共享网口那种） | 需要 `rndis_host` | ❌ 没有 |
+| 任何 **USB 无线**网卡 | — | ❌ 有 `cfg80211`/`ieee80211_` 符号但没有任何芯片驱动 |
+
+挑网卡照这张表买；**Apple 那块（AX88772）实测最省事**。
+
+**用法**：插上 → 开机自启已经把口切 host → 约 5~15 秒 `eth0` 拿到局域网 IP（和手机 WiFi 同网段）
+→ 直接 `ssh -p 8022 root@<那个IP>`。**注意：MIUI 一看到有线网就把 WiFi 关掉**（`wlan0` 变 down），
+所以插着网卡时手机是"有线独占"，WiFi 那条路会断。
+
+**供电**：口在 host 模式、网卡挂在**带供电的 USB Hub** 上时，手机照样充电
+（实测 `usb/type=USB_DCP`、`current_max=1.5A`、电池 Full）。**长期挂机必须用带供电的 Hub。**
+
+**要临时回到 adb（USB 调试）**：在手机上建/删一个开关文件，守护脚本 1 秒内照办：
+
+```sh
+touch /data/local/tmp/n2-nohost   # 切回 peripheral → adb 可用（网卡断开）
+rm    /data/local/tmp/n2-nohost   # 再切回 host → 网卡可用
+```
+
+> 切回 peripheral 后网卡就没了，**这时只能靠 adb 或手动开 WiFi** 操作手机。
+> 所以"刷机/部署阶段"先 `touch` 这个开关，部署完再删。
+
+**实现位置**：`boot_root_payload.sh` 的 §5d 段落会（1）把口切 host，
+（2）把常驻脚本写到 `/data/local/tmp/n2-usbnet.sh` 并拉起，日志 `/data/local/tmp/n2-usbnet.log`。
+常驻脚本只干两件事：**每 1 秒读一次 knob，只有和目标不一致时才写**（避免反复切换把总线抖死）；
+以及万一某个 ROM 没有以太网服务，`eth0` 20 秒还拿不到地址就兜底配静态 `192.168.68.61/24`。
+
+> **维护者必读（本轮踩的坑）**：从 chroot 里启动的脚本**必须自己设 `PATH=/system/bin:/system/xbin`**。
+> 否则它会继承 Debian 的 PATH，`cat`/`date`/`ip`/`sleep` 全部 `not found`；
+> 其中 `sleep` 找不到 ⇒ 循环变成**裸 `echo` 死循环**，每秒上千次写 USB 模式 knob ⇒
+> USB 总线被反复复位：手机 **ssh 长命令全部卡死**（短命令偶尔能挤过去）、load 冲到 4.9、
+> 日志 8 分钟涨 800KB，现场只能靠极短 ssh 命令 `pkill` 救回来。
+> **规矩**：任何可能被 chroot/Android 双环境启动的脚本，开头就固定 PATH；
+> 常驻脚本上线前必须本地 `sh -n` + 端上跑满 30 秒 + 确认日志字节数不再增长。
 
 ## 6. 开机全链（原理）
 

@@ -540,3 +540,57 @@ Release **v1.0**（三个大文件作附件）。`.gitignore` 排除 `rom/ exper
    另外**别用 `git archive` 取内容**：Windows 上它会按 `.gitattributes`/`autocrlf` 把文本转成 CRLF，
    上传的就不等于提交对象（sha 全对不上）；要用 `git cat-file blob <sha>` 取**原始字节**。
 
+### 7.11 USB 网卡：真因是"没切 host 模式"，不是驱动（2026-10-18，设备 4bbc97a9）
+
+**目标**：给 WiFi 坏掉的机器（85126a4c 这类）找到联网办法 ⇒ 插 USB 网卡（第 8 项交付）。
+
+**① 排查走过的弯路（每个都像真的，都记下来）**
+
+1. 先怀疑**驱动缺失** ⇒ 翻内核符号表（`kernel/kallsyms_device.txt` / `System.map.scorpio.txt`）：
+   **有** `asix`(AX88172/88772) / `ax88179_178a` / `cdc_ether` / `cdc_ncm` / `cdc_subset`；
+   **没有** `r8152`（RTL8152/8153/8156 —— 市面上最常见的那些）、`rndis_host`、`smsc95xx`、
+   `dm9601`、`mcs7830`、`pegasus`、`sr9700`、`lan78xx`。
+   `/system/lib/modules` 只有 14 个 ko，**没有任何网卡驱动、也无法 insmod 补**。
+   ⇒ 但当时那块 CDC-ECM 卡（`VID_35B5&PID_3500`「SZNX.10/100」）**是被支持的**却毫无反应
+   ⇒ 说明真因不在驱动。
+2. 真因：**USB 口一直停在 `peripheral`**。MIUI 没有 OTG ID 检测、不会自动切 host ⇒ 网卡根本没被枚举。
+   写一次 `echo host > /sys/devices/soc/6a00000.ssusb/mode`：xhci 起来、网卡枚举、驱动 bind、
+   `eth0` 出现 ⇒ **端到端打通，`ssh root@8022` 走网线成功**。
+3. 换第二块卡（**Apple USB Ethernet Adapter**，内部 AX88772，`VID_05AC&PID_1402`）⇒
+   `asix` bind、`carrier=1 speed=100`、**零报错**。而第一块廉价 ECM 卡会自己掉线
+   （`-71/-110`、`unable to read config descriptor`、偶尔变成 `usb-storage`）⇒ 那是**卡的素质**问题。
+
+**② 关键发现：IP 不用我们配。** `ip rule` / `ip route show table all` 显示 netd 已经给 eth0
+建了策略路由（table 1030/1031）和 `default via 192.168.68.1 table 1031` ⇒
+**Android 自己的以太网服务做了 DHCP**。我们只需负责"切 host"。
+另外 **MIUI 一看到有线网就把 WiFi 关掉**（`wlan0` 变 down）⇒ 插网卡时是有线独占。
+
+**③ 供电**：host 模式下、网卡挂在**带供电 Hub** 上，手机照样充电（`usb/type=USB_DCP`、
+`current_max=1500000`、电池 Full）⇒ 24/7 挂机方案成立，但**必须带供电 Hub**（本机只有一个 USB-C 口）。
+
+**④ 本轮交付**
+
+1. `boot_root_payload.sh` 新增 §5d：**开机把口切 host** + 写并拉起常驻脚本
+   `/data/local/tmp/n2-usbnet.sh`（日志 `/data/local/tmp/n2-usbnet.log`）；
+   开关文件 `/data/local/tmp/n2-nohost` 存在时切回 peripheral（**专给 adb 部署用**）。
+2. 常驻脚本只干两件事：**读 knob、不一致才写**（避免反复切换抖死总线）+ `eth0` 20 秒无地址
+   才兜底配静态 IP（给没有以太网服务的 ROM）。
+3. 删掉本轮早期的 `device/n2-netd.sh`（思路错：它自己抢着配 IP，还无脑重写 knob）。
+
+**⑤ 本轮最大的坑（血泪教训）**：从 chroot 里启动的常驻脚本**没设 PATH** ⇒ 继承了 Debian 的
+`/usr/...`，而 Android 的 userland 在 `/system/bin` ⇒ `cat`/`date`/`ip`/`sleep` 全部 `not found`。
+`sleep` 没了 ⇒ 循环退化成**裸 `echo` 死循环**，每秒上千次写 USB 模式 knob ⇒ USB 总线反复复位：
+**ssh 长命令全部卡死**（短命令偶尔能过）、load 冲到 4.9、日志 8 分钟涨 800KB。
+现场只能靠反复重试"极短 ssh 命令"才 `pkill` 掉。
+⇒ **规矩：任何会被 chroot/Android 双环境启动的脚本，开头先 `PATH=/system/bin:/system/xbin`**；
+常驻脚本上线前：本地 `sh -n` + 端上跑满 30 秒 + `wc -c` 确认日志不再增长。
+
+**⑥ 另一个坑（PC 侧，与手机无关）**：本轮多次"命令卡住 3 分钟"其实是 **scp 没带 keepalive 挂死**，
+文件根本没传上去。⇒ scp 一律带 `-o ServerAliveInterval=5 -o ServerAliveCountMax=3`。
+把文件灌进手机最稳的是 **`Start-Process ssh -RedirectStandardInput <本地文件>`**：
+`cmd /c ... < file` 和 `echo <base64> | ssh` 都被 PowerShell 的引号/行长搞坏过
+（`"` 会被吃掉；27KB 的命令行会被截断 ⇒ 远端报 `Could not resolve hostname #!/system/bin/sh`）。
+另外 **ssh 远程命令里不要出现 `"` 和 `(`**，PowerShell 传参会破坏它们。
+
+**⑦ 待验证**：重启一次（通电自启全链）→ 口自动切 host → `eth0` 自动拿 IP → 不开屏也能 ssh 8022。
+

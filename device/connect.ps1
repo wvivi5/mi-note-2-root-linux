@@ -55,12 +55,16 @@ function Resolve-AdbPath {
     }
     $w = Get-Command adb.exe -ErrorAction SilentlyContinue
     if ($w) { return $w.Source }
-    throw 'adb.exe not found; pass -Adb <path> (or put it in tools\platform-tools\)'
+    return $null
 }
 
+# adb is *optional*: a phone already on the network can be reached with -Ip alone
+# (no USB cable, no adb).  Only "ask the phone for its own address" and the
+# adb-forward fallback need adb, so a missing adb is a warning, not a fatal error.
 $adb = Resolve-AdbPath $Adb
-function A([string[]]$a) { (& $adb @a 2>&1) }
-function Sh([string]$c) { ((& $adb -s $script:Serial shell $c 2>&1) -join "`n").Trim() }
+if (-not $adb) { Warn 'adb.exe not found - lan/ip access still works, but pass -Ip <address> (no adb fallback)' }
+function A([string[]]$a) { if (-not $adb) { return @() }; (& $adb @a 2>&1) }
+function Sh([string]$c) { if (-not $adb -or -not $script:Serial) { return '' }; ((& $adb -s $script:Serial shell $c 2>&1) -join "`n").Trim() }
 
 function Test-Tcp {
     param([string]$h, [int]$p, [int]$ms)
@@ -74,24 +78,33 @@ function Test-Tcp {
 }
 
 # --- pick the device --------------------------------------------------------
-$devs = @((A @('devices')) | Where-Object { $_ -match '^\S+\s+device$' } | ForEach-Object { ($_ -split '\s+')[0] })
-if (-not $Serial) {
-    if ($devs.Count -eq 1) { $Serial = $devs[0] }
-    elseif ($devs.Count -eq 0) { Die 'no device in "device" state (adb devices) - check the cable and USB debugging' }
-    else { Die "several devices connected ($($devs -join ', ')) - pass -Serial <SN>" }
-}
+# With -Ip the phone is targeted by address, so adb is not needed at all; without
+# -Ip we must have a USB device to ask for its address.
 $script:Serial = $Serial
-if ($devs -notcontains $Serial) { Die "device $Serial not in "device" state (connected: $($devs -join ', '))" }
-
-$model = (Sh 'getprop ro.product.model')
-Info "device $Serial ($model)  port $Port"
+$model = ''
+if ($adb -and -not $Ip) {
+    $devs = @((A @('devices')) | Where-Object { $_ -match '^\S+\s+device$' } | ForEach-Object { ($_ -split '\s+')[0] })
+    if (-not $Serial) {
+        if ($devs.Count -eq 1) { $Serial = $devs[0] }
+        elseif ($devs.Count -eq 0) { Die 'no device in "device" state - plug the phone in over USB, or pass -Ip <address>' }
+        else { Die "several devices connected ($($devs -join ', ')) - pass -Serial <SN>" }
+    }
+    if ($devs -notcontains $Serial) { Die "device $Serial not in "device" state (connected: $($devs -join ', '))" }
+    $script:Serial = $Serial
+    $model = (Sh 'getprop ro.product.model')
+} else {
+    if (-not $Serial) { $Serial = $Ip }
+}
+if ($model) { Info "device $Serial ($model)  port $Port" } else { Info "target $Serial  port $Port" }
 
 # --- who to log in as -------------------------------------------------------
 if (-not $User) {
     if ($Port -eq 8022) { $User = 'root' }
     else {
-        $uid = ((Sh 'cmd package list packages -U com.termux') -replace '.*uid:(\d+).*', '$1')
-        if ($uid -match '^\d+$') { $User = 'u0_a' + ([int]$uid - 10000) } else { $User = 'root' }
+        $uid = if ($adb -and $script:Serial) { ((Sh 'cmd package list packages -U com.termux') -replace '.*uid:(\d+).*', '$1') } else { '' }
+        if ($uid -match '^\d+$') { $User = 'u0_a' + ([int]$uid - 10000) }
+        elseif ($adb -and $script:Serial) { $User = 'root' }
+        else { Die "on port $Port the login is the termux app user, and adb is not available to detect it - pass -User u0_aNNN" }
     }
 }
 
@@ -133,6 +146,7 @@ if (-not $ForceAdb) {
 
 # --- 3. fall back to adb forward -------------------------------------------
 if (-not $host_) {
+    if (-not $adb) { Die 'no address answered and adb is not available - check the ip, or plug the phone in over USB' }
     if ($Ip) { Warn "$Ip`:$Port did not answer - falling back to adb forward" }
     $lp = $LocalPort
     if ($lp -le 0) {

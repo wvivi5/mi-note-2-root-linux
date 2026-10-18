@@ -286,6 +286,95 @@ echo "--- listening (1F56=8022 linux, 1F57=8023 termux) ---" >> $LOG
 grep -iE ":1F56|:1F57" /proc/net/tcp >> $LOG 2>&1
 echo "=== root payload done $(date) ===" >> $LOG
 
+# --- 5d. USB ethernet (OTG NIC): keep the port in HOST mode ------------------
+# Measured on this device (2026-10-18, 185):
+#   * MIUI never puts the USB port into host mode by itself -- there is no OTG
+#     ID detection for this port -- so a plugged-in USB NIC stays invisible
+#     ("it is a driver problem" was wrong: the drivers are all built in).
+#   * Writing "host" to the msm-dwc3 knob below makes the dongle enumerate;
+#     the driver binds (asix / ax88179_178a / cdc_ether / cdc_ncm are all in
+#     the kernel) and eth0 appears.
+#   * Android's own Ethernet service then does DHCP on eth0 and moves the phone
+#     onto the wire, turning wifi off in the process.  Nothing else is needed.
+#   * In host mode the phone can still charge when the dongle hangs off a
+#     powered hub (usb/type=USB_DCP, current_max=1.5A, battery Full).
+# Opt out (e.g. to get adb over USB back) with: touch /data/local/tmp/n2-nohost
+USBKNOB=/sys/devices/soc/6a00000.ssusb/mode
+if [ -e $USBKNOB ]; then
+    cat > /data/local/tmp/n2-usbnet.sh <<'USBH'
+#!/system/bin/sh
+# n2-usbnet -- keep the MSM8996 USB port in host mode so an OTG NIC works.
+# MIUI never does this by itself on scorpio; Android's Ethernet service then
+# DHCPs eth0 on its own.  We only hold the knob and, as a safety net for ROMs
+# without ethernet support, give eth0 a static address if 20s pass with none.
+#
+# PATH matters: this script must always see the Android userland (toybox cat /
+# date / ip), never the chroot's Debian userland, or every helper call fails.
+PATH=/system/bin:/system/xbin
+export PATH
+M=/sys/devices/soc/6a00000.ssusb/mode
+LOG=/data/local/tmp/n2-usbnet.log
+FLAG=/data/local/tmp/n2-nohost
+IFACE=eth0
+FALLBACK_IP=192.168.68.61
+GW=192.168.68.1
+log() { echo "[$(date '+%m-%d %H:%M:%S')] $*" >> $LOG; }
+log "=== n2-usbnet start (pid $$) ==="
+idle=0
+blind=0
+while : ; do
+    if [ -e $FLAG ]; then want=peripheral; else want=host; fi
+    cur=$(cat $M 2>/dev/null)
+    if [ "$cur" != "$want" ]; then
+        # Write when we read a different mode, and (belt and braces) every 30s
+        # when the knob cannot be read at all -- but never hammer it every
+        # second, because each write re-runs the dwc3 mode switch.
+        if [ -n "$cur" ] || [ $((blind % 30)) -eq 0 ]; then
+            echo "$want" > $M 2>/dev/null && log "mode: ${cur:-unreadable} -> $want"
+        fi
+        blind=$((blind + 1))
+    else
+        blind=0
+    fi
+    if [ -e /sys/class/net/$IFACE ]; then
+        if ip -4 addr show $IFACE 2>/dev/null | grep -q 'inet '; then
+            idle=0
+        else
+            idle=$((idle + 1))
+            if [ $idle -eq 20 ]; then
+                log "eth0 has no address after 20s -> static $FALLBACK_IP/24"
+                ip link set $IFACE up >>$LOG 2>&1
+                ip addr add $FALLBACK_IP/24 dev $IFACE >>$LOG 2>&1
+                ip route add default via $GW dev $IFACE >>$LOG 2>&1
+                log "eth0: $(ip -4 addr show $IFACE 2>/dev/null | grep inet)"
+            fi
+        fi
+    else
+        idle=0
+    fi
+    sleep 1
+done
+USBH
+    chmod 755 /data/local/tmp/n2-usbnet.sh
+    # Kill an older copy.  A directly-executed script gets its own name as comm;
+    # an older copy started as "sh /data/local/tmp/n2-usbnet.sh" shows up as sh,
+    # so look at the command line as well.
+    for d in /proc/[0-9]*; do
+        case $(cat $d/comm 2>/dev/null) in
+            n2-usbnet*) kill -9 ${d#/proc/} 2>/dev/null; continue ;;
+        esac
+        case $(tr '\0' ' ' < $d/cmdline 2>/dev/null) in
+            *n2-usbnet.sh*) kill -9 ${d#/proc/} 2>/dev/null ;;
+        esac
+    done
+    sleep 1
+    setsid /data/local/tmp/n2-usbnet.sh </dev/null >/dev/null 2>&1 &
+    sleep 2
+    if [ -e /data/local/tmp/n2-nohost ]; then uflag=disabled; else uflag=active; fi
+    echo "--- usb nic: host mode $uflag, knob=$(cat $USBKNOB 2>/dev/null), eth0=$(ip -4 addr show eth0 2>/dev/null | grep inet || echo none) ---" >> $LOG
+    tail -4 /data/local/tmp/n2-usbnet.log >> $LOG 2>&1
+fi
+
 # --- 6. Hand the logs to a place the adb shell user can read ----------------
 # $H is mode 700 and owned by the app, so "adb shell cat $H/boot.log" fails.
 # Copy the interesting bits to /data/local/tmp (world-readable) for diagnostics.
