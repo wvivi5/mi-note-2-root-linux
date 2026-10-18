@@ -1,0 +1,419 @@
+# 小米 Note 2（scorpio）批量部署说明
+
+目标：**开机 → 不用开屏、不用插线碰屏幕 → 自动拿到 root + 自动跑起 Ubuntu → `ssh 8022` 直连 root shell。**
+
+每个设备最终有两条通道：
+
+| 端口 | 身份 | 内容 | 用途 |
+|------|------|------|------|
+| **8022** | `uid 0`（root） | Ubuntu 22.04 chroot | **主通道**，正常都用这个 |
+| 8023 | `u0_a1xx`（App） | Termux（Android 侧） | 救援通道，Linux 挂了还能进去看日志、重跑 |
+
+> `u0_a1xx` 的 **xx 取决于安装顺序**（首次安装 Termux 的 App 排在那个位置，实测遇到过
+> `u0_a143` 和 `u0_a144`）。脚本会自己从 `cmd package list packages -U com.termux` 读出来，
+> 不需要手填；`connect.ps1 -Port 8023` 就是这么干的。
+
+---
+
+## 1. 一次性准备（PC 侧）
+
+- Windows + PowerShell 5.1，`D:\小米note2相关\tools\platform-tools\adb.exe` 里的 adb（脚本会自动找到它，
+  找不到就用参数 `-Adb <路径>` 指定）。
+- ssh 私钥：`%USERPROFILE%\.ssh\note2_key`（脚本默认用这个；没有就用仓库里的 `ssh\note2_key`）。
+  对应公钥已放在 `device\authorized_keys`，会被推到手机上。
+  > **克隆本仓库后**仓库里没有私钥（`.gitignore` 排除了），跑一次
+  > `.\device\make-key.ps1` 生成密钥对并自动写好 `device\authorized_keys` 即可。
+  > Windows 上必须收紧 ACL，否则 ssh 拒绝使用私钥：
+  > `icacls %USERPROFILE%\.ssh\note2_key /inheritance:r /grant:r "%USERNAME%:R"`
+- 手机：**USB 调试已授权**（`adb devices` 能看到 `device` 而不是 `unauthorized`）。
+  **建议不设锁屏密码**：`provision.ps1` 会用 `input` 自动化开 MIUI 自启动，还会用
+  **安装器 UI** 装 APK（MIUI 拦 adb 安装时的降级路径，会真的弹框要点），
+  滑动锁能自动划开，但 **PIN / 图案 / 密码锁会挡住点击** → 会装不上 APK。
+  （如果 9 台都要设密码，就在跑脚本时先手工解锁、并让它保持常亮。）
+- **内核版本必须先核对**：exploit 里的内核地址是**写死**的（取自 `3.18.71-perf-ga01336f`）。
+  换 ROM / 换内核后地址会错，写进随机内核内存 → panic → 因为开机钩子每次都会再跑一次 → **无限重启**。
+  所以：先 `.\device\collect-info.ps1`，只对 verdict 为 `OK - matches the exploit address table`
+  的机器上链（详见 §6 的"内核守卫"）。
+
+### 登录方式
+
+8022（root Ubuntu）**同时**支持两种登录：
+
+| 方式 | 命令 |
+|------|------|
+| 密钥（日常用，推荐） | `ssh -i %USERPROFILE%\.ssh\note2_key -p 8022 root@<ip>` |
+| 密码（随便哪个 ssh 客户端都能用） | `ssh -p 8022 root@<ip>`，密码 **`147147`** |
+
+> **安全提示**：8022 上"能连上 + 知道这个密码"就等于 root。别把 8022 暴露到不可信网络。
+> 想关掉密码登录：`ssh` 进去后 `passwd -l root`（或删 `/root/.n2-pw-set` 后自行改密码），
+> 再删掉 rootfs 里的 `/root/.n2-pw-set` 就不会被下次开机覆盖。密钥登录不受影响。
+
+## 2. 单台部署
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\device\provision.ps1 -Serial <SN>
+```
+
+脚本按顺序做：
+
+1. 装 **Termux** + **Termux:Boot**（未装才装；MIUI 会拒绝 `adb install`，
+   自动降级走**安装器 UI**，见下）
+2. 各启动一次，并**断言 `stopped=false`**（见 §6 的坑；stopped 的包收不到开机广播）
+3. 推送 staging 区 `/data/local/tmp/n2stage`（含 112 MB 的 Ubuntu rootfs 模板 + 70 MB 的 Termux bootstrap）
+4. 跑 CVE-2019-2215 拿 root → `p1.sh`：解包 Termux bootstrap、安装开机钩子、起后台任务
+5. `p2wrap.sh` 后台以 App 身份 `pkg install openssh`（→ 8023），完事 `restorecon` 修标签
+6. UI 自动化打开 MIUI「自启动」白名单（Termux / Termux:Boot）
+7. `adb reboot`，然后**功能性验证**（adb forward + 真的 ssh 登录一次）
+
+### 参数
+
+| 参数 | 作用 |
+|------|------|
+| `-Serial <SN>` | 设备序列号；只有一台连着时可省略 |
+| `-Adb <path>` | 指定 adb.exe |
+| `-Key <path>` | 指定 ssh 私钥 |
+| `-SkipApkInstall` | APK 已装，跳过安装 |
+| `-SkipTermuxPkg` | 跳过 `pkg install openssh`（不要 8023 救援通道时） |
+| `-SkipUi` | 跳过 MIUI 自启动 UI 自动化（自己手开） |
+| `-NoReboot` | 不重启（只在写文件、不验证开机链时用） |
+| `-VerifyOnly` | 只验证当前状态，不改动任何东西 |
+| `-ReinstallTermuxPrefix` | 清 marker，强制重解包 Termux bootstrap |
+| `-ForceKernel` | 内核版本与 exploit 地址表不匹配时**强制**上链（危险，见 §6 内核守卫） |
+
+重复执行是安全的（幂等）：大文件会按大小跳过推送，已有 marker 会跳过重解包。
+
+改完 `boot_root_payload.sh` / `00-startup.sh` 后，**不必重启**就能让改动生效：
+
+```powershell
+.\device\rerun.ps1 -Serial <SN>      # 推送新载荷 → 重新触发内核链 → 校验 8022
+```
+
+它做的是把 staging 里的载荷刷新、再手动 fire 一次 `trigger`（magic 随机且**不可打印**，见 §6）。
+重启当然也可以，只是每台要等 ~90 秒。
+
+## 3. 多台（10 台）
+
+装好一台换下一台 USB，用 `provision-all.ps1`（自动等设备出现、自动汇总、全程写日志）：
+
+```powershell
+# 按插机顺序列出序列号
+.\device\provision-all.ps1 -Serials 4bbc97a9,85126a4c,<sn3>,<sn4>
+
+# 或者：把当前连着的都跑一遍
+.\device\provision-all.ps1
+
+# 有 10 口 USB Hub 时也可一次全插上
+.\device\provision-all.ps1 -Serials (1..10 | ForEach-Object { "<sn$_>" })
+```
+
+它会等每台 `adb devices` 变成 `device`（默认每台最多等 10 分钟，`-WaitMinutes` 可调），
+跑完打印汇总并写 `provision_all_<时间戳>.log`。
+
+装完想快速看整个机队的状态：
+
+```powershell
+.\device\status-all.ps1 -Range 192.168.68.180-199 -Deep
+```
+
+（TCP 直连探测 8022/8023，`-Deep` 顺便真登录一次 8022 打印发行版；`-Csv out.csv` 可导出。）
+
+## 4. 验证
+
+脚本最后会打印 summary。手动复验：
+
+```powershell
+# 局域网直连（推荐；前提是 PC 与手机在同一台路由器/同一网段）
+ssh -p 8022 root@192.168.68.185              # 密钥登录（默认用 note2_key）
+ssh -p 8022 root@192.168.68.185              # 或密码登录，密码 147147
+
+# 也可以用 status-all.ps1 一把梭检查整个机队
+.\device\status-all.ps1 -Range 192.168.68.180-199 -Deep
+
+# 万一网络不通时的兜底：用 adb 转发
+& "D:\小米note2相关\tools\platform-tools\adb.exe" -s 4bbc97a9 forward tcp:8022 tcp:8022
+ssh -i "$env:USERPROFILE\.ssh\note2_key" -p 8022 root@127.0.0.1
+```
+
+期望输出：`Ubuntu 22.04.5 LTS` / 内核 `3.18.71-perf` / `uid=0(root)`。
+
+还想确认"抗杀后台"那套真的生效（跑一次就知道）：
+
+```powershell
+# ssh 进去以后
+cat /var/log/n2watch.log        # 看门狗日志：sshd 挂掉会自动重启，这里留痕
+pgrep -x n2watch | wc -l        # 正常是 2（互为备份）
+for p in $(pgrep -x sshd); do cat /proc/$p/oom_score_adj; done   # 正常都是 -1000
+```
+
+极端一点可以直接杀光 sshd 检验自愈：`pkill -x sshd`（当前连接会断），然后**不做任何操作**，
+20 秒内重新 `ssh` 应该又能进（`/var/log/n2watch.log` 里会多一行 `sshd not listening -> starting it`）。
+
+> **踩过的坑**：曾经出现「手机和 PC 双向不通、但都能上网」，当时误判成 AP 隔离，
+> 实际是现场有**两台路由器**、PC 与手机挂在不同路由下。都接到同一台路由器后立刻直连成功。
+> 所以排查顺序：先确认是不是跨路由/跨网段，再怀疑 AP 隔离。
+
+> **注意**：不要用「端口扫描」判断 8022 是否在听 —— adb shell 是 uid 2000，
+> `/proc/net/tcp` 对非 root 隐藏 uid 0 的套接字，会误判成"没监听"。用真 ssh 连接判断。
+
+## 5. 文件用途
+
+| 文件 | 身份 | 用途 |
+|------|------|------|
+| `provision.ps1` | PC | 一键部署（单台，入口） |
+| `install_apks.ps1` | PC | MIUI 专用的 APK 安装降级：走普通用户安装流程 + 自动点确认框（见 §6） |
+| `provision-all.ps1` | PC | 多台串跑 + 汇总日志 |
+| `status-all.ps1` | PC | 机队状态巡检（TCP 探测 8022/8023，`-Deep` 真登录） |
+| `collect-info.ps1` | PC | **上链前的体检**：逐台读 model/build/补丁级别/内核 `uname -r` 与 `/proc/version`，判定内核是否匹配 exploit 地址表（`-Csv` 可导出） |
+| `rerun.ps1` | PC | 改完载荷后**免重启**重新触发一次 root 链（随机不可打印 magic，见 §6） |
+| `00-startup.sh` | App | Termux:Boot 钩子：自愈式铺文件 + 起 8023 + **内核守卫** + 跑 root 链 → 8022 |
+| `boot_root_payload.sh` | **root** | root 载荷（部署为 `$HOME/n2/rootcmd.sh`）：解包/挂载 Ubuntu rootfs、设 root 密码、起 8022 sshd、起看门狗、刷新开机钩子、导出日志 |
+| `p1.sh` | **root** | 部署期 stage-1：解包 Termux bootstrap、装开机钩子、拉起 p2wrap |
+| `p2wrap.sh` | **root** | 部署期 stage-2 包装：drop 到 App 身份跑 `p2.sh`，然后 `restorecon` |
+| `p2.sh` | App | `pkg install openssh` + 把 sshd 端口改成 8023 |
+| `mp_p1` | — | `modprobe_path` 目标（部署期指向 `p1.sh`） |
+| `n2/e2` | App | exploit 主程序（= `exploit/note2-root`，CVE-2019-2215） |
+| `n2/trigger` | App | 4 字节非法 magic 文件，`execve` 它 → 内核 `request_module()` → 以 root 执行 `modprobe_path` |
+| `n2/mp` | App | `modprobe_path` 目标（开机时指向 `$HOME/n2/rootcmd.sh`） |
+| `authorized_keys` | App | 8022/8023 的登录公钥 |
+| `note2-rootfs.tar.gz` | App | 预装好 openssh-server 的 Ubuntu 22.04 rootfs 模板（**离线部署，不需要联网**） |
+| `termux-bootstrap.tar` | root 解包 | Termux 的 `$PREFIX`（官方 APK 不带 bootstrap） |
+
+### 启动器（.bat）与离线开箱包
+
+上面这些脚本都能双击跑：`device\*.bat` 按编号即顺序，跑完 `pause` 停住（会要你输序列号）。
+
+| 启动器 | 对应脚本 | 说明 |
+|---|---|---|
+| `0-check-environment.bat` | `collect-info.ps1` | 认机器 + 看机型/ROM/内核 |
+| `1-collect-info.bat` | `collect-info.ps1` | 体检结论 OK / NEEDS NEW OFFSETS |
+| `2-provision-one.bat` | `provision.ps1` | 单台部署（提示输序列号） |
+| `3-provision-all.bat` | `provision-all.ps1` | 多台串跑 |
+| `4-status-all.bat` | `status-all.ps1` | 局域网巡检；不填地址就用 **adb 里那几台自报的 IP** |
+| `5-rerun.bat` | `rerun.ps1` | 免重启重跑 root 链 |
+| `6-connect-root.bat` | `connect.ps1` | **开 root shell（自动选路）** |
+| `7-connect-rescue-8023.bat` | `connect.ps1 -Port 8023` | 救援 shell |
+| `8-flash-edl.bat` | `flash_edl.ps1` | EDL 深刷统一开发版（菜单式） |
+| `9-export-logs.bat` | `logs.ps1` | 导出诊断到 `logs\<SN>\` |
+| `A-make-package.bat` | `make-package.ps1` | 重新打出离线开箱包（含 zip） |
+
+**离线开箱包**：`.\device\make-package.ps1`（或 `A-make-package.bat`）会把
+脚本 + adb + 两个 APK + rootfs 模板 + Termux bootstrap + 密钥 + 文档组装到
+`dist\mi-note-2-root-linux\` 并压成 zip。整个文件夹可以直接拷到别的 Windows 上用
+（`.ps1` 里的 adb 查找顺序包含 `tools\platform-tools`，包内自带）。
+`-NoKey` 可以不打进私钥；`-IncludeImages` 会把 3GB 的 ROM 镜像也拷进去（默认不拷）。
+
+### 三条访问通道（`connect.ps1`）
+
+`connect.ps1` 自己决定走哪条路，**WiFi 坏掉的机器也能用**：
+
+1. 问手机自己报的 IPv4（优先 `wlan0`，其次 `eth0` / `usb0` / `rndis0` —— **USB 网卡**就在后两类）；
+2. 依次 TCP 探测 `8022`（或 `-Port` 指定的端口）；
+3. 都不通 → `adb forward tcp:<本地> tcp:<目标>`，从 `127.0.0.1` 进（**纯 USB，不需要任何网络**）。
+
+它会把最终使用的完整 `ssh` 命令打印出来，直接复制到别的终端也能用
+（forward 会刻意留着，拔线才失效）。`-ForceAdb` 可强制走第 3 条（模拟无网机器），
+`-Command '...'` 非交互执行一条，`-DryRun` 只看它选了哪条路。
+
+## 6. 开机全链（原理）
+
+```
+Termux:Boot 开机广播（App 身份 u0_a143）
+  └─ $HOME/.termux/boot/00-startup.sh
+       ├─ 从 /data/local/tmp/n2stage 复制 app 侧文件（App 复制 ⇒ SELinux 标签天然正确）
+       ├─ 采集 device-info.txt（内核/机型/ROM）
+       ├─ 【内核守卫】/proc/version 与 exploit 地址表匹配才继续，否则**跳过 root 链**（只留 8023）
+       ├─ Termux sshd → 8023
+       └─ ./e2 selinux ; ./e2 mp $HOME/n2/mp ; ./trigger
+             └─ 内核 request_module() → modprobe_path → $HOME/n2/rootcmd.sh（uid 0）
+                  ├─ 首次解包 Ubuntu rootfs（模板，离线）
+                  ├─ 挂载 /proc /sys + 私有 tmpfs /dev
+                  ├─ 刷新 $HOME/.termux/boot/00-startup.sh（把载荷/钩子的新版本自我同步进去）
+                  ├─ 设 root 密码 147147（幂等，见下）+ 起 sshd（`PermitRootLogin=yes` `PasswordAuthentication=yes`）
+                  ├─ 起 2 个看门狗（`/root/n2watch`）并把所有 sshd/看门狗 oom_score_adj 压到 -1000
+                  └─ chroot $R /usr/sbin/sshd -p 8022 → 8022（uid 0）
+```
+
+### 内核守卫（换 ROM / 换机型必须用）
+
+exploit 的内核地址（`modprobe_path` / `selinux_enforcing` / `init_uts_ns`）是**写死**的，内核基址没有 KASLR，
+但符号偏移随编译产物变。写错地址会破坏随机内核内存 → panic → 而钩子**每次开机都会再跑** → 无限重启。
+
+所以 `00-startup.sh` 在跑链之前比对 `/proc/version`：命中内置的 `-perf-ga01336f`，或
+`$HOME/n2/kernels.txt` / `/data/local/tmp/n2stage/kernels.txt` 里任一行 pattern 才上链；
+不匹配就**整条 root 链跳过**（只留 8023 救援通道 + 写出 `$HOME/n2/device-info.txt`）。
+人工强制开关是 `$HOME/n2/kernel-force`（文件存在就无视守卫）。
+`provision.ps1 -ForceKernel` 同理（默认不匹配就直接报错退出并说明原因）。
+
+拿 9 台机器时先跑一次 `.\device\collect-info.ps1`，把内核/ROM 列出来；
+不匹配的机器**先别上链**，要把新内核的符号偏移算出来（`collect-info.ps1` 会把 `/proc/version` 打全）。
+
+### 密码（root/147147）
+
+`boot_root_payload.sh` 在 chroot 内 `echo root:147147 | chpasswd`，并用 rootfs 里的标记
+`/root/.n2-pw-set` 保证幂等：rootfs 被重新解包（标记没了）会自动再设；你手动改过密码则不会覆盖。
+sshd 用 `PermitRootLogin=yes` + `PasswordAuthentication=yes` + `UsePAM=no`，所以普通 ssh 客户端
+直接输密码就能进。密码哈希是 Ubuntu 22.04 默认的 `$y$`（yescrypt），OpenSSH 走 `crypt()` 能验。
+
+### 抗杀后台（看门狗 + oom）
+
+MIUI 的"一键清理"、`am force-stop`、低内存杀手都可能干掉我们的进程。三层防护：
+
+1. **`oom_score_adj = -1000`**（所有 sshd + 看门狗）：LMK 永远不会挑它们。
+2. **`/root/n2watch` 看门狗**（chroot 内，2 个互为备份）：每 15 秒检查 `/proc/net/tcp` 是否有
+   **LISTEN 状态**的 8022；掉了就重新拉起 sshd，并把任何"别人起的" sshd 也压成 -1000，
+   自己死了还有同伴补位（60 秒限流，避免误判变 fork 风暴）。
+3. **每次开机由 root 载荷重铺**：哪怕全被杀光，重启一次就全回来。
+
+实测：`pkill -x sshd` 杀光后**零人工操作**，20 秒内自动恢复并重新 ssh 成功
+（`/var/log/n2watch.log` 有记录）。
+
+> 注意：8023（Termux 侧）是**救援通道**，它的存活取决于 Android 是否把 Termux 杀了；
+> 我们只给它也压了 oom_score_adj。真正保证在线的是 8022。
+> 8023 需要联网装 openssh（`p2.sh` 里装）；新装 bootstrap 缺 apt 缓存目录这个坑已修，
+> 实测有 WiFi 的机器 8023 可用（`u0_a144@<ip>:8023`，密钥登录）。
+
+### trigger 的两条硬规则（血泪）
+
+- **magic 前 4 字节不能全是可打印 ASCII**。内核 `search_binary_handler()` 有个反 modprobe 循环的启发式：
+  文件头 4 字节都是可打印字符时**直接返回 ENOEXEC、不调用 `request_module()`**。
+  所以 `33 44 55 66`（`'3DUf'`）这种看起来"更随机"的 magic 反而**静默失效**；
+  `ff ff ff ff`、`12 34 56 78` 这类才有效。`rerun.ps1` 因此随机生成 0x80–0xFF 的 magic。
+- **脚本必须 LF 换行**。PowerShell `>` 重定向 / 某些 `Set-Content` 会写成 CRLF，
+  于是 shell 解析出的重定向目标名里带 `\r`（现象：`avc` 里出现 `name=hi.log<CR>`，
+  文件看起来"没生成"）。用 `[IO.File]::WriteAllText($p, $s)` 且字符串里显式 `` `n ``。
+
+设计要点（都是踩过的坑）：
+
+- **App 侧文件必须由 App 自己复制**：root（kernel 域）写出来的文件缺少 MLS 类别 `s0:c512,c768`，
+  App 打不开（`avc: denied { open }`）。所以 `00-startup.sh` 每次开机都从 staging 重铺一次，顺便自愈。
+- **目录本身的标签也要修，只 `restorecon` 子文件不够**：root 建出来的 `$HOME/.termux` 目录标签缺
+  `:c512,c768`，Termux:Boot 连 `search` 都被拒绝 —— 现象极其隐蔽，**界面上完全没有提示，也不报错**：
+  ```
+  avc: denied { search } for name=".termux" ... tcontext=u:object_r:app_data_file:s0
+  I/termux: No files to execute at boot
+  ```
+  结果就是开机后 8022/8023 全都不起、`$HOME/boot.log` 根本不存在（脚本压根没执行）。
+  所以 `p1.sh` 会把 `$HOME`、`.termux`、`.ssh`、`n2`、`linux` 整体重新打标签。
+- **首次开机慢是正常的**：要解包 112 MB rootfs（实测约 19 秒），加上 Termux:Boot 触发时机，
+  8022 大约 20~60 秒后就绪；rootfs 与 tarball 就位后，之后每次开机几秒。所以验证要**轮询**不要采样一次。
+- **`rm -rf` 绝不能跨越 bind mount**：先解包后挂载，且 `rm` 必带 `--one-file-system`，否则会删掉宿主的 `/dev`。
+- **不要 `chown -R` 整个 App 数据目录**：会把 `$HOME/linux/rootfs` 的属主从 root 改掉，
+  于是 sshd 报 `/run/sshd must be owned by root`。只 chown App 自己的东西。
+- **旧 Android 的内核域拿不到 binder/property 服务**：`setprop`/`pm`/`am` 在 root 载荷里不可用，
+  所以 DNS（`getprop net.dns1`）由 App 侧读出来写成文件给 chroot 用（读不到就用 114/223 兜底）。
+- **chroot 里必须显式设 PATH**（`env -i PATH=...`），否则继承 Android 的 PATH，`apt-get: not found`。
+- **arm64 → 必须用 `/ubuntu-ports/`** 源；apt 还要 `APT::Sandbox::User "root"`。
+- **`stopped=true` 的包收不到开机广播**（BOOT_COMPLETED 是隐式广播，Android 不给 stopped 的包发）。
+  新装的 APK 默认就是 stopped，解法是**启动一次**；`am force-stop` 不会把它置回去。这一条没有任何
+  报错、界面上也看不出来 —— 所以 `provision.ps1` 会**断言并重试** `dumpsys package <pkg> | grep stopped=`，
+  不满足就现场 launch，仍不满足就明确警告。
+- **MIUI 拒绝 `adb install`**：报 `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user`。
+  根因是 MIUI 把 adb 安装改派给 `com.miui.securitycenter/.permcenter.install.AdbInstallActivity`
+  做"用户确认"，而它要小米账号授权 USB 安装、否则 **50 毫秒内自己取消**（没有框可点）。
+  绕过办法 —— **走普通用户安装流程**：`adb push` 到 `/sdcard/Download` → `am start -a VIEW -d file://... -t application/vnd.android.package-archive`
+  → 弹出的是 `com.miui.packageinstaller` 的常规确认框 → 我们自动点：
+  `android:id/button1`（风险提示的"安装"），再点 `com.miui.packageinstaller:id/install_btn`（真正的"安装"）。
+  **按 resource-id 点，不要按中文文本点**（脚本文件是 ASCII，中文会被 ANSI 读乱；而且语言/主题会变）。
+  见 `install_apks.ps1`。注意这条路需要**屏幕解锁**（会真的弹框）。
+- **App 的 uid 必须问包管理器，不能看数据目录属主**：重装 APK 时 PMS 可能分配**新的 shared user id**
+  （现象：logcat 里 `New shared user com.termux: id=10145` + 开机时 `Failed to prepare /data/data/com.termux`），
+  而旧数据目录还是老 uid。App 于是**连自己的 `$HOME`（700）都进不去**，Termux:Boot 只会留下一行
+  `I/termux: No files to execute at boot` —— 表面上"没有脚本"，实际是"看不见"。现在 `p1.sh` 读
+  `provision.ps1` 用 `cmd package list packages -U com.termux` 写下的 `.appuid`，并把**最外层**
+  `/data/data/com.termux` 也 chown 过来（之前只 chown 了里面的 `files/`）。
+- **marker 必须以实际产物为准**：`.prefix_ok` / `.p2_ok` 留在 staging 里会"跨次存活"，但
+  `$PREFIX` 可能已经被 PMS 重装/重建数据目录时 wipe 掉一半。这时 p1 会跳过解包，开机钩子的
+  shebang（`#!/data/data/com.termux/files/usr/bin/sh`）指向不存在的解释器 → `error=13, Permission denied`。
+  所以 p1 会先检查 `$PREFIX/bin/sh`、`$PREFIX/bin/pkg` 是否存在，不在就删掉 marker 重新解包（自愈）。
+- **"8022 在不在"要判定 LISTEN（state `0A`），不能只 grep `:1F56`**：连接断掉后残留的
+  TIME_WAIT 行里同样含 `:1F56`，看门狗会误判"还活着"而永不重启。正确写法是
+  `grep -q ':1F56 00000000:0000 0A' /proc/net/tcp`。
+- **chroot 内的脚本要自己 export PATH**：看门狗是从载荷继承 PATH 的（全是 Termux/Android 路径），
+  在 chroot 里 `sleep`/`grep` 都会 `not found` —— 而且它会变成**死循环刷日志+反复拉 sshd**。
+- **toybox 的 `pidof` 只匹配真正的可执行文件，不匹配脚本**：脚本进程的 `comm` 是脚本名，但它的
+  可执行文件是 `/bin/sh`。所以"按名字找/杀脚本进程"要用 `for d in /proc/[0-9]*; do cat $d/comm; done`
+  扫描，或者 `pgrep -x`（chroot 里的 procps 版才可靠）；`pkill -x` 在 toybox 上也不可靠。
+- **`adb shell` 判 8022 是否在听是不可靠的**：shell 是 uid 2000，`/proc/net/tcp` 里 uid 0 的套接字
+  会被隐藏，容易误判成"没监听"。一律用**真 ssh 登录**判断。
+- **App 身份读不到 `/proc/version`**（SELinux 不允许 untrusted_app 读它，`cat` 静默返回空串）。
+  内核守卫如果用它判断，就会得出"这个内核没有地址"→ **主动跳过整条 root 链**，
+  现象与"钩子根本没跑"一模一样（8022 不亮、`$HOME/boot.log` 里也没有链的痕迹）。
+  守卫必须用 `uname -r`（走 `uname(2)` 系统调用，永远允许）；`/proc/version` 只在 adb shell/root 里读。
+- **出问题时要看得到日志**：`$HOME/boot.log` 是 App 私有（目录 700），而能读它的是 root ——
+  恰好是失败时拿不到的东西。所以钩子把关键行同时镜像到 logcat（`log -t n2boot "N2 ..."`），
+  任何时候 `adb logcat -s n2boot` 都能看到开机链走到哪一步。
+  注意 toybox 的 `log` 会把**以 `-` 开头**的消息当选项解析（`log: Unknown option -`）而丢掉，
+  所以镜像的消息统一加前缀（`N2 ...`）。
+- **不要就地覆盖"正在被执行的脚本"**。载荷每次开机都要刷新 `$HOME/.termux/boot/00-startup.sh`，
+  而那个脚本**此刻正在跑**（链路就是从它尾部启动的）。`cp -f` 会截断重写同一个 inode，shell 是按
+  字节偏移继续读文件的 ⇒ 读到半截内容 ⇒ `Syntax error: "(" unexpected`，钩子尾部被跳过。
+  正确做法：写到临时文件（且放在 `boot/` 之外，免得被 Termux:Boot 当成第二个开机脚本执行），
+  再 `mv` 原子替换 —— 运行中的 shell 继续读旧 inode，安全。
+- **新装的 Termux bootstrap 没有 apt 缓存目录**：`pkg install` 会静默失败，
+  报 `E: Archives directory /data/data/com.termux/cache/apt/archives/partial is missing`，
+  于是 **8023 救援通道"看起来是没网"其实是缺目录**。`p2.sh` 现在先 `mkdir -p` 再装 openssh。
+
+## 7. 出问题时
+
+| 症状 | 处理 |
+|------|------|
+| PC 连不上手机 8022 | 先确认 PC 与手机在**同一台路由器/同一网段**（跨路由器会出现"都能上网但互访不通"）；排除了再怀疑 AP/客户端隔离。用 `status-all.ps1 -Range <网段> -Deep` 逐个探。兜底用 adb forward |
+| 8022 不通，8023 通 | ssh 到 8023 看 `$HOME/boot.log`（root 载荷的输出）和 `/data/local/tmp/p1.log` |
+| 8022 / 8023 都不通 | 看 MIUI 自启动是否真开了（手动开一遍）；再 `adb shell am start -n com.termux/com.termux.app.TermuxActivity` 手工触发一次 |
+| 都不通，且 `$HOME/boot.log` **不存在** | Termux:Boot 收到广播但脚本没跑起来（这条最有欺骗性，界面上毫无提示）。`adb logcat -b main,system -d \| findstr /i "termux boot"`，看到 `avc: denied { search } for name=".termux"` + `I/termux: No files to execute at boot` 就是标签问题：root 跑一遍 `restorecon -R $HOME/.termux $HOME/.ssh $HOME/n2`（见 §6）。正常的 `p1.sh` 会自动做，无需手工 |
+| logcat 有 `I/termux: No files to execute at boot`，但没有 avc denial | App **看不见**自己的 `$HOME`：查 `dumpsys package com.termux \| grep uid` 与 `stat -c %u /data/data/com.termux` 是否一致。不一致就重跑 `provision.ps1`（会写 `.appuid` 并让 p1 重新 chown），或手工 root `chown -R <uid>:<uid> /data/data/com.termux/files /data/data/com.termux` |
+| logcat 有 `Cannot run program ".../00-startup.sh" ... error=13` | Termux prefix 被 wipe 但 staging 的 `.prefix_ok` 还在 → 重跑 `provision.ps1 -ReinstallTermuxPrefix`（或删 `.prefix_ok`）；新版 p1 已能自愈 |
+| `adb install` 报 `INSTALL_FAILED_USER_RESTRICTED` | 正常现象，MIUI 拦 adb 安装。`provision.ps1` 会自动降级到 `install_apks.ps1`（需要**屏幕解锁**）；也可手工在开发者选项里打开"USB 安装"（要登录小米账号） |
+| MIUI 自启动没开上 | 脚本用 `uiautomator dump` + 点击，锁屏/PIN 会导致失败 → 解锁后重跑 `provision.ps1 -SkipApkInstall` |
+| 想完全重置这台机器 | `adb shell pm clear com.termux`，然后 `adb shell rm -rf /data/local/tmp/n2stage`，再跑一遍 `provision.ps1` |
+| ssh 突然掉线、8022 连不上（手机还开着） | 先等 20 秒再试：看门狗（15 秒一轮）会自动把 sshd 拉起来。进去看 `/var/log/n2watch.log` 有没有 `sshd not listening -> starting it` |
+| 想让某台"重启一次就全回来" | 直接 `adb reboot`。整条链模拟了"进程被杀光"的极端情况，重启即恢复 |
+| 冷启动后 8022 不亮，也看不出钩子跑没跑 | `adb logcat -s n2boot` —— 钩子会把关键行镜像到 logcat（`N2 ...`），能直接看到走到哪一步、守卫是否放行 |
+| 8022 起不来，`/data/local/tmp/boot.log` 里有 `kernel guard` 字样 | 这台机器的内核/ROM 与 exploit 地址表不匹配，守卫**故意**跳过了 root 链（避免无限重启）。先 `collect-info.ps1` 确认，再决定是否重算偏移或 `-ForceKernel` |
+| 改了载荷但不想重启 | `.\device\rerun.ps1 -Serial <SN>` |
+| 忘了密码 / 想关掉密码登录 | ssh 用密钥进去后 `passwd root` 改密码（不会被开机覆盖，因为有 `/root/.n2-pw-set`）；要彻底禁用就 `passwd -l root` |
+| ssh 报 `Permission denied (publickey)` 但密码是对的 | 检查服务器是否真开了密码登录：`ps -ef \| grep 'sshd -p 8022'` 应看到 `PasswordAuthentication=yes`；看门狗拉起来的 sshd 也带这些参数 |
+
+**没有写任何验签分区**（boot / system / vendor / persist 全没碰），所以不需要"还原镜像"；
+最坏情况是某次开机提权没成功，重启或重跑部署即可。要彻底清理只需清 App 数据 + 删 staging。
+
+## 8. 统一 ROM：为什么要刷、怎么刷
+
+**原因**：exploit 里的内核地址是**量出来的常数**（取自 `3.18.71-perf-ga01336f`，也就是
+**MIUI 开发版 9.8.29 / Android 8.0** 那个内核）。稳定版或其它版本的符号偏移不一样，
+写错地址 → panic → 钩子每次开机都再跑一遍 → **无限重启**。所以机队要么全部刷成同一版，
+要么逐台重新量偏移（`collect-info.ps1` 会直接给结论）。
+
+**做法**：`flash_edl.ps1`（菜单入口 `8-flash-edl.bat`），走 **EDL(9008) 深刷**：
+
+```powershell
+.\device\flash_edl.ps1 -List                    # 只列将写入的分区（不用插手机）
+.\device\flash_edl.ps1 -Wait -Reset             # 等 9008 出现 → 刷 → 重启
+.\device\flash_edl.ps1 -Loop -Reset             # 一台接一台连续刷（Ctrl+C 停）
+.\device\flash_edl.ps1 -ComPort COM3 -Reset     # 端口已知时直接指定
+```
+
+要点：
+
+- **不需要解 BL**（EDL 走的是 9008 载荷，bootloader 全程锁着）。
+- 需要**短接主板测试点**进 9008，这一步没法脚本化；脚本会等你（`-Wait`）。
+- `patch0.xml` 的 `NUM_DISK_SECTORS` 在刷机时按本机真实 UFS 容量重算（64GB 机器也正确）。
+- `persist` / `devinfo` / `modemst1,2` / `fsg` / `fsc` / `keystore` / `frp` 的 `filename` 为空
+  ⇒ **不写**，所以 **IMEI、传感器校准、密钥库都保留**（`-List` 里显示成 `(kept as-is)`）。
+- 刷完开机是**全新系统**：要重新打开 USB 调试 + 重新授权（`adb devices` 会先显示 `unauthorized`），
+  然后回到 §2 走一遍 `provision.ps1`。
+- 镜像不在仓库里（约 3GB，属小米）：解包 `rom\scorpio_dev_9.8.29.tgz`，
+  或用 `-Images <目录>` 指定（目录里要有 `rawprogram0.xml` / `patch0.xml` / `prog_*firehose*.elf`）。
+- MiFlash 工具（`fh_loader.exe` / `QSaharaServer.exe`）也不在仓库里，`-Tools <目录>` 指定，
+  或放在仓库的 `tools\MiFlash20220507\MiFlash20220507\`（脚本会自动找）。
+
+## 9. 离线开箱包 & 发布
+
+- **打包**：`.\device\make-package.ps1`（或 `A-make-package.bat`）→ `dist\mi-note-2-root-linux\`
+  \+ `dist\mi-note-2-root-linux-v1.0.zip`。内容 = 启动器 + 全部脚本 + adb + 两个 APK +
+  rootfs 模板 + Termux bootstrap + 密钥 + 文档；`-NoKey` 不打私钥，`-IncludeImages` 才拷 ROM 镜像。
+- **发布**：仓库 `mi-note-2-root-linux`。`.gitignore` 排除了 `rom/` `experiment/` `kernel/` `tools/`
+  和三个超 100MB 的文件（`note2-rootfs.tar.gz` 115MB、`termux-bootstrap.tar` 72MB、
+  `com.termux_1002.apk` 111MB）—— 这三个走 **GitHub Release 附件**。
+- **私钥绝不进仓库**（`ssh/note2_key` 被忽略）；克隆后跑 `.\device\make-key.ps1` 生成自己的密钥。
+

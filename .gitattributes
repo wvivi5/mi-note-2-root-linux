@@ -1,0 +1,23 @@
+# Line endings matter here: the .sh files are pushed to an Android device and
+# executed by /system/bin/sh, which chokes on CR.  The .bat files need CRLF.
+* text=auto
+
+*.sh   text eol=lf
+*.ps1  text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.bat  text eol=crlf
+
+# Shell scripts that get run by the kernel / init without a matching extension.
+device/mp_p1  text eol=lf
+
+# Never touch these.
+*.gz   -text
+*.tar  -text
+*.apk  -text
+*.exe  -text
+*.dll  -text
+*.img  -text
+*.elf  -text
+device/n2/*       -text
+exploit/note2-root -text

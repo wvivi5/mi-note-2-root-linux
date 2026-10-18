@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------- never publish
+# Reference material and binaries that do not belong in the repo: too big, third
+# party, or machine specific.
+rom/
+experiment/
+kernel/
+tools/
+backup_preflash/
+dist/
+logs/
+
+# Private keys, and the key material of the author's own phones.
+ssh/note2_key
+ssh/note2_key.pub
+
+# Over GitHub's 100 MB per-file limit -> published as Release assets instead.
+device/note2-rootfs.tar.gz
+device/termux-bootstrap.tar
+termux/com.termux_1002.apk
+
+# Scratch / probe leftovers.
+_cmds_probe*.json
+_fastboot_table.txt
+*.err.log
+
+# Windows junk.
+Thumbs.db
+desktop.ini
