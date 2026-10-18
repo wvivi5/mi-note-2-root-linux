@@ -75,13 +75,31 @@
 
 ## 五、有的手机没有 WiFi / WiFi 坏了
 
-不用管。`6-connect-root.bat` 会自动按这个顺序挑一条能用的路：
+**首选：插 USB 网卡**（已经做成开机自启，手机上什么都不用点）：
+
+1. 用**带供电的 USB Hub** 接手机，网卡插在 Hub 上（手机只有一个 USB-C 口；
+   带供电的 Hub 顺便还能给手机充电 —— 实测 host 模式下照充，1.5A）；
+2. 开机后约 5~15 秒，`eth0` 会自己拿到局域网 IP（Android 自己的以太网服务做的 DHCP），
+   然后 `ssh -p 8022 root@<那个IP>` 就能进。
+
+> 网卡芯片必须在"内核支持列表"里：**ASIX AX88772（Apple 那块就是它）/ AX88179 / CDC-ECM / CDC-NCM**。
+> **RTL8152/8153/8156（绿联这类最常见的）和所有 USB 无线网卡都不行** ——
+> 内核里没有驱动、也补不了（`/system/lib/modules` 只有 14 个 ko）。
+> 完整表格看 `device\README.md` 的「USB 有线网卡」一节。
+
+注意：**插上网卡后 MIUI 会把 WiFi 关掉**（有线独占），插着网卡时手机只能走网线。
+
+**要临时插电脑用 adb**：在手机上执行 `touch /data/local/tmp/n2-nohost`
+（守护脚本 1 秒内把 USB 口切回 peripheral，adb 立刻可用）；想切回网卡模式就
+`rm /data/local/tmp/n2-nohost`。“刷机/部署阶段”建议先切 peripheral，装完再切回来。
+
+**兜底：一条网络都没有也能进。** `6-connect-root.bat` 会自动按这个顺序挑一条能用的路：
 
 1. 手机自己报的 IPv4（优先 `wlan0`，然后 `eth0`/`usb0`/`rndis0` —— USB 网卡就是这一类）；
-2. 都不通 → 自动做 `adb forward tcp:8022 tcp:8022`，从 `127.0.0.1` 进，**纯 USB 也能进**。
+2. 都不通 → 自动 `adb forward tcp:8022 tcp:8022`，从 `127.0.0.1` 进，**纯 USB 也能进**。
 
-它会把最终用的 ssh 命令打出来，你可以直接复制到别的终端里用。
-命令行也能手动指定：`device\connect.ps1 -Serial <SN> -ForceAdb`。
+它会把最终用的 ssh 命令打出来，可以直接复制到别的终端用。
+命令行手动指定：`device\connect.ps1 -Serial <SN> -ForceAdb`。
 
 ---
 
