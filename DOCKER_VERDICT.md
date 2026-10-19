@@ -58,6 +58,44 @@
    能跑别的发行版 rootfs，不依赖内核 namespace/cgroup；但只是 ptrace 模拟，性能有损失，同样是"伪隔离"。
 4. **真要 Docker 生态** ⇒ 换一台能跑 Docker 的机器（x86 小主机 / 刷了 Armbian 的盒子）。
 
+## 社区结论（Termux 官方 + 社区实践，2026-10 调研）
+
+**官方态度**：Termux 维护者 Grimler91 在 [issue #15662](https://github.com/termux/termux-packages/issues/15662)
+（2023-03 开，**至今仍 open**）里对"docker run 失败"的回复是 —— 要**自定义内核**：
+
+> "Do you have a custom kernel with cpuset enabled, i.e. `CONFIG_CGROUPS` and `CONFIG_CPUSETS`?
+> Download and run the [check-config.sh](https://github.com/moby/moby/blob/master/contrib/check-config.sh) script to check your config"
+
+要点：
+
+- Termux 官方的 docker 包放在 **root-repo**（`pkg install root-repo && pkg install docker`），
+  但构建配方**停在 20.10.12（2021-12）**，之后再没更新过。
+- 就算 root + 手动挂好 cgroup，runc 仍会死在设备内核的 cgroup 布局上。issue 里
+  2023 年的 armv7 盒子、**2024 年的新手机（Nothing CMF Phone 1）**报的都是同一类错
+  （`CONFIG_CGROUP_DEVICE: missing`、`CONFIG_IPC_NS: missing`、`CONFIG_PID_NS: missing`）。
+  ⇒ **这是 Android 内核的通病，不是 Note 2 一台的毛病。**
+- 对照 moby `check-config.sh` 的 "Generally Necessary" 清单，本机缺：
+  `CONFIG_CGROUP_DEVICE`、`CONFIG_IPC_NS`、`CONFIG_UTS_NS`、`CONFIG_USER_NS`、
+  `CONFIG_OVERLAY_FS`、`CONFIG_NF_NAT` / `IP_NF_TARGET_MASQUERADE` 等（正是前面实测到的那些）。
+
+**社区里"能正常用"的几条路：**
+
+| 路线 | 是不是真 Docker | 依赖 | 本机可行 | 代价 |
+|------|----------------|------|----------|------|
+| 改内核后原生跑（Ivon 教程：编内核开 `CONFIG_CGROUPS` / `CGROUP_DEVICE` / `OVERLAY_FS`… 再刷 boot.img） | ✅ | 重编内核 + **解 BL** | ❌ 本机 BL 锁死 | — |
+| **QEMU 虚拟机 + 真 dockerd**（`sulthonzh/android-docker-qemu`、`luisdavim/termux-qemu-docker`、`cyberkernelofficial/docker-in-termux`） | ✅ 真 dockerd + compose | Termux + QEMU，**不碰内核** | ✅ | 无 KVM ⇒ 纯 TCG 模拟，**慢** |
+| **proot-distro**（Termux 官方维护；5.x 起能直接从 Docker Hub 拉 OCI 镜像、从 Dockerfile 构建镜像） | ❌ 没有 daemon | ptrace | ✅ | 慢、无隔离 |
+| LXC（需 root + cgroup + systemd） | 半（能跑容器，不是 Docker 生态） | 内核 cgroup / namespace | ❌ 同样缺 | — |
+
+**对本机的建议：**
+
+1. 只是要 **Docker 镜像里的东西能用** ⇒ 把镜像**解包成目录**，直接 `chroot` 跑（原生速度，
+   而且我们已经有 root + chroot）—— 这是最省事、最快的。
+2. 要**真 Docker / compose** ⇒ 用 QEMU 起一个 **aarch64** 的 Alpine/Debian 虚拟机，里面跑真 dockerd，
+   再用 Termux:Boot 自启（社区几个项目就是这么做的）。
+   ⚠️ 注意：网上教程大多用 `qemu-system-x86_64` 客户机，那是 ARM 手机上**最慢**的组合；
+   用 **aarch64 客户机**（`qemu-system-aarch64`）是同架构翻译，快得多。
+
 ## 已做的清理
 
 - 测试用的 cgroup 挂载点**已全部 umount**（`/proc/self/mountinfo` 里已无 cgroup 条目）
