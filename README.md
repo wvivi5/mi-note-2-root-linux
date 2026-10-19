@@ -20,6 +20,7 @@ ssh 进去的 Linux 小盒子 —— 这就是这个仓库的全部内容。
 | 落地 | 改 `modprobe_path` 指向 helper → 内核 UMH 以 **root** 执行它 | 不依赖任何已安装的 root 工具 |
 | 关 SELinux | 写 `selinux_enforcing` = 0 | 之后 root 载荷才跑得动 |
 | 持久化 | **Termux:Boot** 的 `~/.termux/boot/00-startup.sh`（开机自动执行） | App 身份，不碰任何验签分区 |
+| 通电自启 | **PMIC RTC 闹钟**（`/dev/rtc0` + `RTC_WKALM_SET`）：把**已关机**的手机开机回来；按 RTC 自身 24h 时钟每 30 分钟（`:00`/`:30`）轮询，**不看日期** | 锁 BL 的 LK 无视 `oem off-mode-charge`，但 PMIC 闹钟照样能开机 |
 | Linux | Ubuntu 22.04 rootfs + `chroot`，chroot 内起 sshd | 不用容器、不用内核模块 |
 | 抗杀后台 | sshd / 看门狗 `oom_score_adj=-1000` + chroot 内 2 个互为备份的看门狗 | MIUI 会杀后台，看门狗 15 秒自愈 |
 | 防砖 | 开机链**先比内核**（`uname -r`），不匹配就整条不跑 | exploit 地址写死，换内核会 panic 无限重启 |

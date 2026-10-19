@@ -30,7 +30,11 @@
 
 **已执行且成功的操作：**
 - `fastboot oem unlock-go` → `FAILED (remote: 'Token verification failed')`（解锁确实死透）
-- `fastboot oem off-mode-charge 0` → **OKAY** ✅（= 关掉“关机充电模式”，**插电即开机**，直击“通电自启”需求）
+- `fastboot oem off-mode-charge 0` → **OKAY**，但**实测无效** ❌
+  - 值能写入、断电后仍保留（`getvar` 始终为 0），但锁 BL 的 LK **启动时不认**：关机插电仍进电池图标充电模式，内核根本没启动。
+  - `oem disable-charger-screen` 同样只改显示标志（`Charger screen enabled: false`），不影响启动决策。
+  - 已实测 `0` / `1` 两个值，均无效 → **本机软件层做不到“关机插电自动开机”**。
+  - 该命令只在**已解锁 BL** 的机器上有意义；本机解锁不可行（`Token verification failed`）。
 
 ---
 
@@ -90,8 +94,9 @@
 ### 2.4 自启
 | 方式 | 说明 |
 |---|---|
-| **termux/termux-boot**（Termux:Boot） | 开机自启脚本（Termux 生态标准做法） |
-| **`fastboot oem off-mode-charge 0`** | ✅ 已设置：**关机状态下插电即自动开机**（本机支持） |
+| **termux/termux-boot**（Termux:Boot） | 开机自启脚本（Termux 生态标准做法），负责"开机后自动起 Linux" |
+| **PMIC RTC 闹钟**（已实现，主方案） | ✅ **端到端实测通过**：`/dev/rtc0` 的 `RTC_WKALM_SET` 能把**已关机**的手机开机回来（纯软件）。按 RTC 自身 24h 时钟**每 30 分钟**（`:00`/`:30`）轮询，**不看日期**（RTC 停在 1970 也无所谓）。旋钮：`/data/local/tmp/n2-rtc-step`（秒） |
+| ~~**`fastboot oem off-mode-charge`**~~ | ❌ **实测无效**：锁 BL 的 LK 不认该开关（0/1 均仍进充电模式）。但**已不需要**它 |
 | Linux Deploy 自启 / Tasker / 自启 App | 备选 |
 
 ---
@@ -103,7 +108,7 @@
 2. `pkg update` → 装 `proot-distro`，`proot-distro install debian`，`proot-distro login debian`。
 3. 桌面：`termux-x11`/VNC（可选）。
 4. 自启：装 **Termux:Boot**，把启动脚本放 `~/.termux/boot/`。
-5. 通电自启：`oem off-mode-charge 0`（已设）+ 保持 Termux:Boot。
+5. 通电自启：**用 PMIC RTC 闹钟实现**（`oem off-mode-charge` 在锁 BL 下无效，但**已不需要**它）。分工：Termux:Boot 负责"开机后自动起 Linux"，RTC 闹钟负责"把已关机的手机自动开机回来"。
 - **优点**：不动系统、可逆、10 台都能做。**缺点**：proot 有性能损耗、非真 root。
 
 ### 路线 2（临时 root）：内核漏洞提权
@@ -570,12 +575,16 @@ Release **v1.0**（三个大文件作附件）。`.gitignore` 排除 `rom/ exper
 
 **④ 本轮交付**
 
-1. `boot_root_payload.sh` 新增 §5d：**开机把口切 host** + 写并拉起常驻脚本
-   `/data/local/tmp/n2-usbnet.sh`（日志 `/data/local/tmp/n2-usbnet.log`）；
-   开关文件 `/data/local/tmp/n2-nohost` 存在时切回 peripheral（**专给 adb 部署用**）。
-2. 常驻脚本只干两件事：**读 knob、不一致才写**（避免反复切换抖死总线）+ `eth0` 20 秒无地址
-   才兜底配静态 IP（给没有以太网服务的 ROM）。
-3. 删掉本轮早期的 `device/n2-netd.sh`（思路错：它自己抢着配 IP，还无脑重写 knob）。
+1. `boot_root_payload.sh` 新增 §5d：**默认 peripheral（adb 开箱可用），host 由硬件信号自动判定**
+   + 写并拉起常驻脚本 `/data/local/tmp/n2-usbnet.sh`（日志 `/data/local/tmp/n2-usbnet.log`）。
+   判定优先级：手动开关文件 `/data/local/tmp/n2-host` / `/data/local/tmp/n2-nohost` >
+   `$HOME/n2/usbmode`（Termux 家目录，屏幕即可写、无需网络） > 充电口类型（`USB_CDP/USB_SDP`
+   = 电脑 → peripheral）> 有线已插（online=1，无主机驱动 → host，给网卡）> 什么都没插 → peripheral。
+2. 常驻脚本只干两件事：**每秒读一次 knob，目标不一致才写**（避免反复切换抖死总线）
+   + `eth0` 20 秒无地址才兜底配静态 IP（给没有以太网服务的 ROM）。
+3. PC 侧一键切模式：`device/usbmode.ps1 -Mode host|peripheral|auto|status` + `device/C-usb-mode.bat`
+  （双击即可，纯 ASCII）；`status` 会打印充电口类型、udc 状态、已挂 USB 设备，方便确认对端是谁。
+4. 删掉本轮早期的 `device/n2-netd.sh`（思路错：它自己抢着配 IP，还无脑重写 knob）。
 
 **⑤ 本轮最大的坑（血泪教训）**：从 chroot 里启动的常驻脚本**没设 PATH** ⇒ 继承了 Debian 的
 `/usr/...`，而 Android 的 userland 在 `/system/bin` ⇒ `cat`/`date`/`ip`/`sleep` 全部 `not found`。
@@ -585,6 +594,11 @@ Release **v1.0**（三个大文件作附件）。`.gitignore` 排除 `rom/ exper
 ⇒ **规矩：任何会被 chroot/Android 双环境启动的脚本，开头先 `PATH=/system/bin:/system/xbin`**；
 常驻脚本上线前：本地 `sh -n` + 端上跑满 30 秒 + `wc -c` 确认日志不再增长。
 
+**⑥ 自动切换的边界（新增）**：手机在 host 模式时 PC 什么也看不到（两个主机互斥），
+adb 会断 —— 这是物理互斥，不是故障。常驻脚本会自动把"被电脑占的口"切回 peripheral，
+所以**插电脑就能 adb 是自动恢复的**；如果卡在 host 且什么也没插（没网卡也没 WiFi），
+用手机屏幕打开 Termux、`echo peripheral > $HOME/n2/usbmode` 即可让 adb 回来。
+
 **⑥ 另一个坑（PC 侧，与手机无关）**：本轮多次"命令卡住 3 分钟"其实是 **scp 没带 keepalive 挂死**，
 文件根本没传上去。⇒ scp 一律带 `-o ServerAliveInterval=5 -o ServerAliveCountMax=3`。
 把文件灌进手机最稳的是 **`Start-Process ssh -RedirectStandardInput <本地文件>`**：
@@ -592,5 +606,6 @@ Release **v1.0**（三个大文件作附件）。`.gitignore` 排除 `rom/ exper
 （`"` 会被吃掉；27KB 的命令行会被截断 ⇒ 远端报 `Could not resolve hostname #!/system/bin/sh`）。
 另外 **ssh 远程命令里不要出现 `"` 和 `(`**，PowerShell 传参会破坏它们。
 
-**⑦ 待验证**：重启一次（通电自启全链）→ 口自动切 host → `eth0` 自动拿 IP → 不开屏也能 ssh 8022。
+**⑦ 待验证**：重启一次（通电自启全链）→ 口自动按 flag/信号决策（插网卡 Hub → host，
+插电脑 → peripheral，空着 → peripheral）→ `eth0` 自动拿 IP → 不开屏也能 ssh 8022。
 

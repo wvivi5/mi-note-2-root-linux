@@ -60,7 +60,11 @@
 6. 跑完双击 `6-connect-root.bat`（留空=只有一台连着）→ 应该直接进 `#` 提示符，
    `id` 显示 `uid=0(root)`。
 7. **拔掉 USB 重启手机**，等 30~45 秒，再双击 `4-status-all.bat` 填手机 IP 段，
-   8022 应该自动就在了 —— 这才叫"通电自启"。
+   8022 应该自动就在了 —— 这就是"开机自启"。
+
+   想验证"**关机也能自己回来**"（现场停电场景）：`adb shell reboot -p` 关机，然后等最多
+   30 分钟（PMIC RTC 闹钟每 30 分钟轮询一次），手机会自己开机、8022 自己回来 ——
+   不用碰手机。详见 `device\README.md` 的「通电自启（PMIC RTC 闹钟）」。
 
 ---
 
@@ -75,7 +79,7 @@
 
 ## 五、有的手机没有 WiFi / WiFi 坏了
 
-**首选：插 USB 网卡**（已经做成开机自启，手机上什么都不用点）：
+**首选：插 USB 网卡**（开机自启，手机上什么都不用点）：
 
 1. 用**带供电的 USB Hub** 接手机，网卡插在 Hub 上（手机只有一个 USB-C 口；
    带供电的 Hub 顺便还能给手机充电 —— 实测 host 模式下照充，1.5A）；
@@ -89,9 +93,33 @@
 
 注意：**插上网卡后 MIUI 会把 WiFi 关掉**（有线独占），插着网卡时手机只能走网线。
 
-**要临时插电脑用 adb**：在手机上执行 `touch /data/local/tmp/n2-nohost`
-（守护脚本 1 秒内把 USB 口切回 peripheral，adb 立刻可用）；想切回网卡模式就
-`rm /data/local/tmp/n2-nohost`。“刷机/部署阶段”建议先切 peripheral，装完再切回来。
+**USB 口的角色（host 网卡 / peripheral adb）现在是自动判断的**，不需要手动开关：
+
+- 插电脑（充电口是数据口）→ **peripheral**，adb 立刻可用；
+- 插带网卡的供电 Hub → **host**，`eth0` 自动组网；
+- 什么都不插 → **peripheral**，adb 随时可用。
+
+手机上的常驻脚本每秒重新判断一次，角色变了会在 1 秒内自动切。
+
+**手动强制某个角色**（PC 侧双击 `device\C-usb-mode.bat`，或手机上 adb/shell/Termux）：
+
+| 想要 | 命令 | 生效 |
+|---|---|---|
+| host（网卡） | `touch /data/local/tmp/n2-host`  ＋  `rm -f /data/local/tmp/n2-nohost` | ≤1 秒 |
+| peripheral（adb） | `touch /data/local/tmp/n2-nohost`  ＋  `rm -f /data/local/tmp/n2-host` | ≤1 秒 |
+| 还原自动判断 | `rm -f /data/local/tmp/n2-host /data/local/tmp/n2-nohost` | 立刻 |
+| Termux 屏幕自救（无需 adb） | 把 `host` / `peripheral` 写到 `$HOME/n2/usbmode` | ≤1 秒 |
+
+或双击 `device\C-usb-mode.bat` 选 `host` / `peripheral` / `auto` / `status`。
+`status` 会打印充电口类型、udc 状态、已挂的 USB 设备。
+
+> 口在 host 时 PC 什么都看不到（两个主机对着干），adb 会断 —— 这是物理互斥，不是故障；
+> 常驻脚本会自动把被电脑占的口切回 peripheral，所以**"插电脑就能 adb"是自动恢复的**。
+> 如果万一卡在 host 且什么也没插，用手机屏幕打开 Termux，
+> `echo peripheral > $HOME/n2/usbmode` 即可让 adb 回来。
+
+切回 peripheral 后网卡就没了，**这时只能靠 adb 或手动开 WiFi** 操作手机。
+所以"刷机/部署阶段"先切 peripheral，装完再切回 host（或留 auto）。
 
 **兜底：一条网络都没有也能进。** `6-connect-root.bat` 会自动按这个顺序挑一条能用的路：
 

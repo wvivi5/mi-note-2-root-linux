@@ -38,6 +38,11 @@ echo "=== root payload start $(date) uid=$(id -u) ===" >> $LOG
 # edited 00-startup.sh would never reach a device that is already provisioned.
 STAGE=/data/local/tmp/n2stage
 [ -d $STAGE ] || STAGE=/data/local/tmp
+# Termux:Boot only fires when ~/.termux/boot exists and is readable by the app.
+# On a device that booted before the hook was ever deployed this dir is missing,
+# so nothing would ever create it.  Make it here (as root); the chown below
+# hands it to the app, so the next boot is self-healing.
+mkdir -p $H/.termux/boot 2>>$LOG
 if [ -f $STAGE/00-startup.sh ] && [ -d $H/.termux/boot ]; then
     APPUID=$(cat $STAGE/.appuid 2>/dev/null | tr -dc 0-9)
     [ -n "$APPUID" ] || APPUID=$(ls -nd $H/.termux/boot/00-startup.sh 2>/dev/null | awk '{print $3}')
@@ -51,6 +56,8 @@ if [ -f $STAGE/00-startup.sh ] && [ -d $H/.termux/boot ]; then
         # hook is skipped.  rename(2) swaps the inode instead: the running shell
         # keeps reading the old inode, and a half-finished copy can never be
         # executed.  The temp name lives outside boot/ so Termux:Boot never runs it.
+        chown $APPUID:$APPUID $H/.termux/boot 2>>$LOG
+        chmod 700 $H/.termux/boot 2>>$LOG
         TMPHOOK=$H/.termux/.00-startup.new
         if cp -f $STAGE/00-startup.sh $TMPHOOK 2>>$LOG; then
             chmod 700 $TMPHOOK 2>>$LOG
@@ -116,7 +123,151 @@ mkdir -p $R/dev/pts 2>>$LOG
 [ -e $R/dev/urandom ] || mknod -m 666 $R/dev/urandom c 1 9 2>>$LOG
 [ -e $R/dev/tty ]     || mknod -m 666 $R/dev/tty     c 5 0 2>>$LOG
 [ -e $R/dev/ptmx ]    || mknod -m 666 $R/dev/ptmx    c 5 2 2>>$LOG
+# PMIC RTC, for the wake-alarm helper in section 2b (the major/minor can vary).
+# Without this node the chroot cannot arm the RTC wake alarm.
+RTCMM=$(cat /sys/class/rtc/rtc0/dev 2>/dev/null)
+if [ -n "$RTCMM" ] && [ ! -e $R/dev/rtc0 ]; then
+    mknod -m 660 $R/dev/rtc0 c "${RTCMM%:*}" "${RTCMM#*:}" 2>>$LOG
+fi
 mount -t devpts devpts $R/dev/pts 2>>$LOG
+
+# --- 2b. RTC wake alarm: boot the phone back up after a power cut ------------
+# WHY: the locked bootloader ignores `fastboot oem off-mode-charge`, so if the
+# phone is off when power returns it just sits in charger mode (Mi logo ->
+# battery icon; the kernel never starts) and sshd never comes up.  The PMIC RTC
+# alarm DOES power the phone on, though -- verified on this unit: arm the alarm,
+# `reboot -p`, and the phone boots itself at the alarm time.  So we keep a wake
+# alarm armed on the RTC's own clock:  while the phone is up this is just a
+# harmless re-arm (verified: the IRQ does not reboot or pop a dialog), and while
+# it is off the PMIC uses it to boot -> this whole chain runs again.
+#
+# SCHEDULING IS TIME-OF-DAY ONLY.  The alarm slot is the next :00 boundary of the
+# RTC's daily dial (or :00/:30 for STEP=1800, etc.), so the DATE IS NEVER
+# CONSULTED.  It does not matter whether the RTC reports 1970 or 2026 -- we only
+# read hh:mm:ss and ask "how many seconds until the next slot?".  The date/year
+# fields are filled in only because the ioctl wants a full struct.  A reset or
+# revert of the clock therefore cannot strand the alarm in some far-away year:
+# whatever the RTC says now, the next slot is at most STEP seconds away.
+#
+# It runs *early* on purpose: section 5d used to walk /proc and block there
+# (payload stuck in read() on a pipe), and anything placed after it would never
+# run.
+#
+# STEP = slot size in seconds.  Default 1800 = poll every 30 min, on :00 and
+#   :30 of the RTC's dial.  900 -> every 15 min;  3600 -> hourly.
+# Smaller STEP = a phone that was off comes back sooner after a power cut.
+# Override with   /data/local/tmp/n2-rtc-step   (plain integer seconds).
+# python3 and a working /dev/rtc0 live in the chroot (node created just above).
+if [ -e $R/dev/rtc0 ] && [ -x $R/usr/bin/python3 ]; then
+    cat > $R/root/n2rtc.py <<'RTCPY'
+#!/usr/bin/env python3
+# Arm the PMIC RTC wake alarm at the next time-of-day slot -- date is ignored.
+import fcntl, os, ctypes, sys, time, calendar
+
+class RtcTime(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_int) for n in
+                ('sec', 'min', 'hour', 'mday', 'mon', 'year', 'wday', 'yday', 'isdst')]
+
+class RtcWkAlrm(ctypes.Structure):
+    _fields_ = [('enabled', ctypes.c_ubyte), ('pending', ctypes.c_ubyte), ('time', RtcTime)]
+
+SzT = ctypes.sizeof(RtcTime)
+SzW = ctypes.sizeof(RtcWkAlrm)
+
+def IOW(t, n, s): return (1 << 30) | (s << 16) | (ord(t) << 8) | n
+def IOR(t, n, s): return (2 << 30) | (s << 16) | (ord(t) << 8) | n
+
+RTC_RD_TIME   = IOR('p', 0x09, SzT)
+RTC_WKALM_SET = IOW('p', 0x0f, SzW)
+
+step = int(sys.argv[1]) if len(sys.argv) > 1 else 1800
+if step <= 0:
+    step = 1800
+
+fd = os.open('/dev/rtc0', os.O_RDWR)
+buf = bytearray(SzT)
+fcntl.ioctl(fd, RTC_RD_TIME, buf, True)
+t = RtcTime.from_buffer(buf)
+
+# --- the whole decision: seconds into the RTC's day, rounded up to a slot ----
+# GUARD: if the next slot is imminent, aim one whole slot further out.  The
+# daemon re-arms before that slot arrives, so while the phone is UP the alarm
+# never actually fires -- and, more to the point, there is never an instant with
+# no alarm armed.  Without this, a slot firing while the phone is up would clear
+# the PMIC alarm, and a power cut in the few seconds before the daemon re-armed
+# would leave the phone off until someone pressed the power button.
+sod = t.hour * 3600 + t.min * 60 + t.sec
+guard = 45
+delta = step - (sod % step)
+if delta <= guard:
+    delta += step
+
+# The date fields below are only bookkeeping for the ioctl; the scheduling
+# above never looks at them.  Adding "delta" to the RTC's own clock (not to the
+# system clock) is what makes this independent of the actual date.
+now = calendar.timegm((t.year + 1900, t.mon + 1, t.mday, t.hour, t.min, t.sec, 0, 0, 0))
+tm = time.gmtime(now + delta)
+w = RtcWkAlrm()
+w.enabled = 1
+w.pending = 0
+w.time.sec, w.time.min, w.time.hour = tm.tm_sec, tm.tm_min, tm.tm_hour
+w.time.mday, w.time.mon, w.time.year = tm.tm_mday, tm.tm_mon - 1, tm.tm_year - 1900
+w.time.wday, w.time.yday, w.time.isdst = tm.tm_wday, tm.tm_yday, 0
+c = ctypes.create_string_buffer(SzW)
+ctypes.memmove(c, ctypes.byref(w), SzW)
+try:
+    fcntl.ioctl(fd, RTC_WKALM_SET, c, True)
+    print("slot %02d:%02d:%02d (step %ds)" % (tm.tm_hour, tm.tm_min, tm.tm_sec, step), flush=True)
+except OSError as e:
+    print("WKALM_SET fail:", e, flush=True)
+os.close(fd)
+RTCPY
+    chmod 755 $R/root/n2rtc.py
+
+    cat > $R/root/n2rtcalarm <<'RTCS'
+#!/bin/sh
+# Keep a PMIC RTC wake alarm armed at the next time-of-day slot.  The date is
+# ignored; only the RTC's hh:mm:ss matters (see n2rtc.py).
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+echo $$ > /run/n2rtcalarm.pid
+STEP=${1:-1800}
+case "$STEP" in ''|*[!0-9]*) STEP=1800 ;; esac
+[ "$STEP" -lt 300 ] && STEP=300
+LOG=/var/log/n2rtc.log
+echo "$(date) n2rtcalarm start pid=$$ step=${STEP}s (time-of-day only)" >> $LOG
+# Re-arm every 15s.  The guard in n2rtc.py only moves the target on a slot
+# boundary, so log just when it changes -- a line every 15s would be ~5760
+# lines a day.
+LAST=
+while :; do
+    out=$(/usr/bin/python3 /root/n2rtc.py "$STEP" 2>&1)
+    case "$out" in
+        *fail*|"") echo "$(date) $out" >> $LOG ;;
+        *) if [ "$out" != "$LAST" ]; then
+               echo "$(date) $out" >> $LOG
+               LAST=$out
+           fi ;;
+    esac
+    sz=$(wc -c < $LOG 2>/dev/null)
+    [ -n "$sz" ] && [ "$sz" -gt 65536 ] && { tail -n 200 $LOG > $LOG.tmp; mv -f $LOG.tmp $LOG; }
+    sleep 15
+done
+RTCS
+    chmod 755 $R/root/n2rtcalarm
+
+    # Start it unless the recorded pid is still alive.  A pidfile avoids walking
+    # /proc, which is exactly what makes section 5d hang.
+    oldpid=$(cat $R/run/n2rtcalarm.pid 2>/dev/null)
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+        echo "--- rtc alarm daemon already running (pid $oldpid) ---" >> $LOG
+    else
+        RTC_STEP=$(cat /data/local/tmp/n2-rtc-step 2>/dev/null)
+        case "$RTC_STEP" in ''|*[!0-9]*) RTC_STEP=1800 ;; esac
+        setsid chroot $R /root/n2rtcalarm "$RTC_STEP" </dev/null >>$LOG 2>&1 &
+        sleep 2
+        echo "--- rtc alarm armed (step=${RTC_STEP}s): $(tail -1 $R/var/log/n2rtc.log 2>/dev/null) ---" >> $LOG
+    fi
+fi
 
 # DNS for the chroot: the script that runs as the *app* (which can query
 # properties) prepares it, because root in the kernel domain cannot getprop.
@@ -286,57 +437,162 @@ echo "--- listening (1F56=8022 linux, 1F57=8023 termux) ---" >> $LOG
 grep -iE ":1F56|:1F57" /proc/net/tcp >> $LOG 2>&1
 echo "=== root payload done $(date) ===" >> $LOG
 
-# --- 5d. USB ethernet (OTG NIC): keep the port in HOST mode ------------------
-# Measured on this device (2026-10-18, 185):
+# --- 5d. USB role: host (OTG NIC) or peripheral (adb) -- decided automatically
+# Measured on this device (2026-10-18):
 #   * MIUI never puts the USB port into host mode by itself -- there is no OTG
-#     ID detection for this port -- so a plugged-in USB NIC stays invisible
-#     ("it is a driver problem" was wrong: the drivers are all built in).
-#   * Writing "host" to the msm-dwc3 knob below makes the dongle enumerate;
-#     the driver binds (asix / ax88179_178a / cdc_ether / cdc_ncm are all in
-#     the kernel) and eth0 appears.
-#   * Android's own Ethernet service then does DHCP on eth0 and moves the phone
-#     onto the wire, turning wifi off in the process.  Nothing else is needed.
-#   * In host mode the phone can still charge when the dongle hangs off a
-#     powered hub (usb/type=USB_DCP, current_max=1.5A, battery Full).
-# Opt out (e.g. to get adb over USB back) with: touch /data/local/tmp/n2-nohost
+#     ID detection on this port -- so a plugged-in USB NIC stays invisible
+#     ("it is a driver problem" was wrong: asix / ax88179_178a / cdc_ether /
+#     cdc_ncm are all built into this kernel; r8152 is not).
+#   * Writing "host" to the msm-dwc3 knob makes the dongle enumerate, the driver
+#     binds and eth0 appears; Android's own Ethernet service then does DHCP on
+#     eth0 (and switches wifi off).  Nothing else is needed.
+#   * The two roles are mutually exclusive (one USB-C port) and sticky, so the
+#     choice has to be made from hardware signals:
+#       - charger port reports USB_CDP/USB_SDP  -> a computer is on the wire
+#         (data-capable port)                     -> peripheral, adb works
+#       - udc state = default/addressed/configured -> a real host drives us
+#                                                 -> peripheral, do not yank adb
+#       - charger port reports USB_DCP / unknown, plain VBUS, no host on the
+#         wire -> a powered hub or a charger      -> host, so a NIC can appear
+#       - online != 1 (nothing plugged) => no NIC is possible -> peripheral,
+#         so adb is always ready out of the box
+#     Once a device actually enumerates in host mode we stay host; while a real
+#     host drives us we stay peripheral.  Only in the ambiguous case (VBUS but
+#     neither side present) do the roles alternate, HOLD seconds each.
+#   * In host mode the phone still charges when the dongle hangs off a powered
+#     hub (usb/type=USB_DCP, current_max=1.5A, battery Full).
+# Manual overrides (first match wins, and they beat the automatic rules):
+#   /data/local/tmp/n2-host   (host)      /data/local/tmp/n2-nohost (peripheral)
+#   $HOME/n2/usbmode containing "host" or "peripheral"   <- Termux, needs no net
 USBKNOB=/sys/devices/soc/6a00000.ssusb/mode
 if [ -e $USBKNOB ]; then
     cat > /data/local/tmp/n2-usbnet.sh <<'USBH'
 #!/system/bin/sh
-# n2-usbnet -- keep the MSM8996 USB port in host mode so an OTG NIC works.
-# MIUI never does this by itself on scorpio; Android's Ethernet service then
-# DHCPs eth0 on its own.  We only hold the knob and, as a safety net for ROMs
-# without ethernet support, give eth0 a static address if 20s pass with none.
+# n2-usbnet -- decide the USB role automatically and hold it.
+#
+#   host       = this phone is a USB host: an OTG NIC enumerates and Android's
+#                Ethernet service DHCPs eth0.  adb is dead in this role.
+#   peripheral = this phone is a USB device: a PC sees it (adb / MTP).  No NIC.
+#
+# The rules are documented in boot_root_payload.sh section 5d; in short: a
+# data-capable charger port or a real host driving us means peripheral, plain
+# VBUS with no host means host (try for a NIC), nothing plugged means peripheral.
+# Manual override files (see above) always win.
 #
 # PATH matters: this script must always see the Android userland (toybox cat /
-# date / ip), never the chroot's Debian userland, or every helper call fails.
-PATH=/system/bin:/system/xbin
-export PATH
+# date / ip / sleep), never the chroot's Debian userland, or every helper call
+# fails -- and a missing "sleep" turns the loop into a fork storm that resets
+# the USB bus thousands of times a second (see PLAN.md 7.11).
+export PATH=/system/bin:/system/xbin
+echo $$ > /data/local/tmp/n2-usbnet.pid
 M=/sys/devices/soc/6a00000.ssusb/mode
 LOG=/data/local/tmp/n2-usbnet.log
-FLAG=/data/local/tmp/n2-nohost
+FLAG_HOST=/data/local/tmp/n2-host
+FLAG_PERI=/data/local/tmp/n2-nohost
+TMODE=/data/data/com.termux/files/home/n2/usbmode
+CHGT=/sys/class/power_supply/usb/type
+CHGO=/sys/class/power_supply/usb/online
+UDC=/sys/class/udc
 IFACE=eth0
 FALLBACK_IP=192.168.68.61
 GW=192.168.68.1
+HOLD=30
 log() { echo "[$(date '+%m-%d %H:%M:%S')] $*" >> $LOG; }
-log "=== n2-usbnet start (pid $$) ==="
-idle=0
+# is a device attached to us? (only meaningful while we are host; the root hubs
+# usb1/usb2 have no "-" in their name and are skipped)
+have_device() {
+    for d in /sys/bus/usb/devices/*/; do
+        case $(basename "$d" 2>/dev/null) in
+            *-*) [ -f "$d/idVendor" ] && return 0 ;;
+        esac
+    done
+    return 1
+}
+# is a real USB host driving our device port?  "powered" alone only means VBUS
+# (charger/hub) and must NOT count.
+have_host() {
+    for u in $UDC/*/state; do
+        [ -e "$u" ] || continue
+        case $(cat "$u" 2>/dev/null) in
+            default|addressed|configured) return 0 ;;
+        esac
+    done
+    return 1
+}
+# print "<mode> <why>"
+decide() {
+    [ -e $FLAG_HOST ] && { echo "host manual-flag"; return; }
+    [ -e $FLAG_PERI ] && { echo "peripheral manual-flag"; return; }
+    case $(cat $TMODE 2>/dev/null) in
+        host)       echo "host termux-override"; return ;;
+        peripheral) echo "peripheral termux-override"; return ;;
+    esac
+    case $ctype in
+        USB_CDP|USB_SDP) echo "peripheral computer-port"; return ;;
+    esac
+    [ "$online" != 1 ] && { echo "peripheral nothing-plugged"; return; }
+    have_host && { echo "peripheral host-driving"; return; }
+    if [ "$cur" = host ]; then
+        if have_device; then
+            # 设备重新出现，重置丢失计时器
+            dev_lost=0
+            echo "host device-attached"; return
+        fi
+        # 设备暂时不见（如插 PD 供电线导致总线复位）：
+        # 进入观察期，先等网卡重新枚举，不要立即放弃 host。
+        if [ $dev_lost -eq 0 ]; then
+            dev_lost=1
+            dev_lost_since=$since
+        fi
+        if [ $((since - dev_lost_since)) -lt $DEV_LOST_WAIT ]; then
+            echo "host waiting-for-device"; return
+        fi
+        # 观察期结束仍无设备：只有电脑数据口才切回 peripheral；
+        # 纯充电器/分线器（DCP/Unknown）不切，保持 host 等网卡重新插入。
+        case $ctype in
+            USB_CDP|USB_SDP) echo "peripheral computer-port"; return ;;
+        esac
+        echo "host keep (awaiting NIC)"; return
+    fi
+    [ $since -lt $HOLD ] && { echo "peripheral holding"; return; }
+    echo "host probing"
+}
+cur=$(cat $M 2>/dev/null)
+online=$(cat $CHGO 2>/dev/null)
+ctype=$(cat $CHGT 2>/dev/null)
+log "=== n2-usbnet start (pid $$) role=${cur:-?} online=${online:-?} charger=${ctype:-?} ==="
+# Start by holding the current role for HOLD seconds -- EXCEPT when the charger
+# port is already known to be a pure power port (USB_DCP), which means a powered
+# hub / charger rather than a computer, so probing for a NIC right away is safe.
+since=0
+case $ctype in USB_DCP) since=$HOLD ;; esac
+# 设备丢失观察期：host 模式下设备瞬间消失（如插 PD 供电线导致总线复位）
+# 时，先等 DEV_LOST_WAIT 秒看网卡是否重新枚举，不要立即放弃 host。
+dev_lost=0
+dev_lost_since=0
+DEV_LOST_WAIT=15
 blind=0
 while : ; do
-    if [ -e $FLAG ]; then want=peripheral; else want=host; fi
+    online=$(cat $CHGO 2>/dev/null)
+    ctype=$(cat $CHGT 2>/dev/null)
     cur=$(cat $M 2>/dev/null)
-    if [ "$cur" != "$want" ]; then
+    d=$(decide)
+    want=${d%% *}
+    why=${d#* }
+    if [ -n "$cur" ] && [ "$cur" != "$want" ]; then
         # Write when we read a different mode, and (belt and braces) every 30s
         # when the knob cannot be read at all -- but never hammer it every
         # second, because each write re-runs the dwc3 mode switch.
         if [ -n "$cur" ] || [ $((blind % 30)) -eq 0 ]; then
-            echo "$want" > $M 2>/dev/null && log "mode: ${cur:-unreadable} -> $want"
+            echo "$want" > $M 2>/dev/null && log "role: $cur -> $want ($why)"
         fi
         blind=$((blind + 1))
+        since=0
     else
         blind=0
+        since=$((since + 1))
     fi
-    if [ -e /sys/class/net/$IFACE ]; then
+    if [ "$want" = host ] && [ -e /sys/class/net/$IFACE ]; then
         if ip -4 addr show $IFACE 2>/dev/null | grep -q 'inet '; then
             idle=0
         else
@@ -356,24 +612,37 @@ while : ; do
 done
 USBH
     chmod 755 /data/local/tmp/n2-usbnet.sh
-    # Kill an older copy.  A directly-executed script gets its own name as comm;
-    # an older copy started as "sh /data/local/tmp/n2-usbnet.sh" shows up as sh,
-    # so look at the command line as well.
-    for d in /proc/[0-9]*; do
-        case $(cat $d/comm 2>/dev/null) in
-            n2-usbnet*) kill -9 ${d#/proc/} 2>/dev/null; continue ;;
-        esac
-        case $(tr '\0' ' ' < $d/cmdline 2>/dev/null) in
-            *n2-usbnet.sh*) kill -9 ${d#/proc/} 2>/dev/null ;;
-        esac
-    done
+    # Stop an older copy via its pidfile.  Walking /proc and reading
+    # /proc/*/cmdline used to be the way, but that read blocks on this kernel
+    # (the shell parks forever in read() on a pipe) -- which also meant section 6
+    # never ran and /data/local/tmp/boot.log went stale.  The daemon writes its
+    # own pid instead, so there is no /proc walk and nothing to race with.
+    oldpid=$(cat /data/local/tmp/n2-usbnet.pid 2>/dev/null)
+    case "$oldpid" in
+        ''|*[!0-9]*) ;;
+        *)
+            # pids get reused, so only kill it if it still is the daemon
+            case $(cat /proc/$oldpid/comm 2>/dev/null) in
+                n2-usbnet*) kill -9 "$oldpid" 2>/dev/null ;;
+            esac
+            ;;
+    esac
     sleep 1
     setsid /data/local/tmp/n2-usbnet.sh </dev/null >/dev/null 2>&1 &
-    sleep 2
-    if [ -e /data/local/tmp/n2-nohost ]; then uflag=disabled; else uflag=active; fi
-    echo "--- usb nic: host mode $uflag, knob=$(cat $USBKNOB 2>/dev/null), eth0=$(ip -4 addr show eth0 2>/dev/null | grep inet || echo none) ---" >> $LOG
-    tail -4 /data/local/tmp/n2-usbnet.log >> $LOG 2>&1
+    sleep 3
+    uhost=no; uperi=no
+    [ -e /data/local/tmp/n2-host ] && uhost=yes
+    [ -e /data/local/tmp/n2-nohost ] && uperi=yes
+    uterm=$(cat $H/n2/usbmode 2>/dev/null)
+    ustate=$(cat /sys/class/udc/*/state 2>/dev/null)
+    # NB: deliberately no `ip | grep` here.  Command substitutions that pipe have
+    # been seen to block on this kernel (the payload parked forever in read());
+    # a diagnostic line is not worth risking the whole boot chain for.
+    echo "--- usb role: knob=$(cat $USBKNOB 2>/dev/null) charger=$(cat /sys/class/power_supply/usb/type 2>/dev/null) online=$(cat /sys/class/power_supply/usb/online 2>/dev/null) udc=${ustate:-none} man(host=$uhost peri=$uperi termux=${uterm:-unset}) ---" >> $LOG
+    tail -3 /data/local/tmp/n2-usbnet.log >> $LOG 2>&1
 fi
+
+# (the RTC wake-alarm scheduler lives in section 2b, above section 3)
 
 # --- 6. Hand the logs to a place the adb shell user can read ----------------
 # $H is mode 700 and owned by the app, so "adb shell cat $H/boot.log" fails.

@@ -235,24 +235,43 @@ for p in $(pgrep -x sshd); do cat /proc/$p/oom_score_adj; done   # 正常都是 
 
 挑网卡照这张表买；**Apple 那块（AX88772）实测最省事**。
 
-**用法**：插上 → 开机自启已经把口切 host → 约 5~15 秒 `eth0` 拿到局域网 IP（和手机 WiFi 同网段）
-→ 直接 `ssh -p 8022 root@<那个IP>`。**注意：MIUI 一看到有线网就把 WiFi 关掉**（`wlan0` 变 down），
+**默认**：USB 口现在**默认是 peripheral（adb）**，插电脑开箱就能 adb，不需要手动开关。
+开机/插线后，手机上的常驻脚本 `/data/local/tmp/n2-usbnet.sh` 每秒自动判断并守住对的角色：
+
+- 对端是电脑（充电口报 `USB_CDP`/`USB_SDP`，或手机设备口被枚举）→ **peripheral**，adb 可用；
+- 对端是带网卡的供电 Hub（`USB_DCP`，纯供电，没主机在驱动）→ **host**，`eth0` 自动组网；
+- 什么都没插（`online != 1`）→ **peripheral**，adb 随时可用。
+
+一旦角色和当前不一致，守护脚本 1 秒内写一下模式 knob；之后不再动（避免把 USB 总线抖死）。
+
+**用法（24/7 网卡机器）**：插上带供电的 Hub + 网卡 → 开机约 5~15 秒 `eth0` 拿到局域网 IP
+→ `ssh -p 8022 root@<那个IP>`。**注意：MIUI 一看到有线网就把 WiFi 关掉**（`wlan0` 变 down），
 所以插着网卡时手机是"有线独占"，WiFi 那条路会断。
 
 **供电**：口在 host 模式、网卡挂在**带供电的 USB Hub** 上时，手机照样充电
 （实测 `usb/type=USB_DCP`、`current_max=1.5A`、电池 Full）。**长期挂机必须用带供电的 Hub。**
 
-**要临时回到 adb（USB 调试）**：在手机上建/删一个开关文件，守护脚本 1 秒内照办：
+**手动强制某个角色**（PC 侧双击 `device\C-usb-mode.bat`，或手机上 adb/shell/Termux）：
 
-```sh
-touch /data/local/tmp/n2-nohost   # 切回 peripheral → adb 可用（网卡断开）
-rm    /data/local/tmp/n2-nohost   # 再切回 host → 网卡可用
-```
+| 想要 | 命令 | 生效 |
+|---|---|---|
+| host（网卡） | `touch /data/local/tmp/n2-host`  ＋  `rm -f /data/local/tmp/n2-nohost` | ≤1 秒 |
+| peripheral（adb） | `touch /data/local/tmp/n2-nohost`  ＋  `rm -f /data/local/tmp/n2-host` | ≤1 秒 |
+| 还原自动判断 | `rm -f /data/local/tmp/n2-host /data/local/tmp/n2-nohost` | 立刻 |
+| Termux 屏幕自救（无需 adb） | 把 `host` / `peripheral` 写到 `$HOME/n2/usbmode` | ≤1 秒 |
 
-> 切回 peripheral 后网卡就没了，**这时只能靠 adb 或手动开 WiFi** 操作手机。
-> 所以"刷机/部署阶段"先 `touch` 这个开关，部署完再删。
+或者双击 `device\C-usb-mode.bat` 选 `host` / `peripheral` / `auto` / `status`：
+`status` 会打印充电口类型、udc 状态、已挂的 USB 设备，方便确认对端是谁。
 
-**实现位置**：`boot_root_payload.sh` 的 §5d 段落会（1）把口切 host，
+> 口在 host 时 PC 什么都看不到（两个主机对着干），adb 会断 —— 这是物理互斥，不是故障。
+> 常驻脚本会自动把"被电脑占的口"切回 peripheral，所以**"插电脑就能 adb"是自动恢复的**；
+> 如果万一卡在 host 且什么也没插（既没网卡也没 WiFi），用手机屏幕打开 Termux，
+> `echo peripheral > $HOME/n2/usbmode` 即可让 adb 回来。
+
+切回 peripheral 后网卡就没了，**这时只能靠 adb 或手动开 WiFi** 操作手机。
+所以"刷机/部署阶段"先切 peripheral，部署完再切回 host（或留 auto）。
+
+**实现位置**：`boot_root_payload.sh` 的 §5d 段落会（1）按上面的优先级判定目标角色，
 （2）把常驻脚本写到 `/data/local/tmp/n2-usbnet.sh` 并拉起，日志 `/data/local/tmp/n2-usbnet.log`。
 常驻脚本只干两件事：**每 1 秒读一次 knob，只有和目标不一致时才写**（避免反复切换把总线抖死）；
 以及万一某个 ROM 没有以太网服务，`eth0` 20 秒还拿不到地址就兜底配静态 `192.168.68.61/24`。
@@ -278,10 +297,12 @@ Termux:Boot 开机广播（App 身份 u0_a143）
              └─ 内核 request_module() → modprobe_path → $HOME/n2/rootcmd.sh（uid 0）
                   ├─ 首次解包 Ubuntu rootfs（模板，离线）
                   ├─ 挂载 /proc /sys + 私有 tmpfs /dev
+                   ├─ 【RTC 闹钟】武装 PMIC 唤醒闹钟到下一个 :00/:30（每 30 分钟轮询，见下）
                   ├─ 刷新 $HOME/.termux/boot/00-startup.sh（把载荷/钩子的新版本自我同步进去）
                   ├─ 设 root 密码 147147（幂等，见下）+ 起 sshd（`PermitRootLogin=yes` `PasswordAuthentication=yes`）
                   ├─ 起 2 个看门狗（`/root/n2watch`）并把所有 sshd/看门狗 oom_score_adj 压到 -1000
-                  └─ chroot $R /usr/sbin/sshd -p 8022 → 8022（uid 0）
+                  ├─ USB 网卡守护 n2-usbnet.sh（自动 host/peripheral）
+                   └─ chroot $R /usr/sbin/sshd -p 8022 → 8022（uid 0）
 ```
 
 ### 内核守卫（换 ROM / 换机型必须用）
@@ -322,6 +343,40 @@ MIUI 的"一键清理"、`am force-stop`、低内存杀手都可能干掉我们�
 > 我们只给它也压了 oom_score_adj。真正保证在线的是 8022。
 > 8023 需要联网装 openssh（`p2.sh` 里装）；新装 bootstrap 缺 apt 缓存目录这个坑已修，
 > 实测有 WiFi 的机器 8023 可用（`u0_a144@<ip>:8023`，密钥登录）。
+
+### 通电自启（PMIC RTC 闹钟）—— 现场停电靠它
+
+锁 BL 的 LK 无视 `fastboot oem off-mode-charge`：插电时如果手机是关机的，只会停在**充电模式**
+（mi logo → 电池图标），Android 和我们的 Linux 都不会起。但 **PMIC 的 RTC 唤醒闹钟能把
+*已关机* 的手机开机回来** —— 已端到端实测：`reboot -p` 关机后，闹钟到点手机自己开机。
+
+载荷在 chroot 里跑一个常驻守护 `n2rtcalarm`，把 `/dev/rtc0` 的唤醒闹钟（`RTC_WKALM_SET`）
+**每 30 分钟**武装一次：
+
+- **只看时分秒，不看日期。** 这机器的 RTC 停在 `1970-01-02`，`RTC_SET_TIME` 还被 QSEE
+  拒绝（改不了），但都无所谓：每次都是"读 RTC 现在的时分秒 → 算到下一个 `:00`/`:30`
+  还差几秒 → 加在 **RTC 自己的时钟** 上"。RTC 复不复位、停在 1970 还是 2026，闹钟永远
+  在最多 30 分钟内到点。
+- **30 分钟是"轮询间隔"**：关机时最多 30 分钟被叫醒一次；开机状态下每到 `:00`/`:30`
+  也会重新武装（守护每 15 秒重算一次）。
+- **不会误触发**：离下一个 slot 只剩 <45 秒时直接跳到再下一个 slot，所以**开机状态下闹钟
+  从不会真的"响"**（同时也就永远留着一个已武装的闹钟，不会出现"空窗"）。
+- **"时刻"不是墙上时间**：RTC 的 22:xx 对不上真实时间，所以 `:00`/`:30` 落在真实的哪一分钟
+  是随机的 —— 反正要的是"最多 30 分钟回来一次"，不是"每天几点"。
+
+配置（可选）：`echo 1800 > /data/local/tmp/n2-rtc-step`（秒；1800=30 分，900=15 分，
+3600=1 小时）。改完重启一次生效，或 `kill $(cat /run/n2rtcalarm.pid)` 等下次开机重铺。
+
+排查：
+
+| 看什么 | 命令 |
+|---|---|
+| 守护在不在 | `ps -ef \| grep n2rtcalarm`、`cat /run/n2rtcalarm.pid` |
+| 武装到几点 | `cat /proc/driver/rtc`（看 `alrm_time` / `alarm_IRQ`） |
+| 历史 | `tail /var/log/n2rtc.log`（`slot HH:MM:SS (step Ns)`；失败会打 `WKALM_SET fail:`） |
+
+> 注意：**完全断电**（拔电池 / 电池彻底耗尽）若让 PMIC 也掉电，RTC 会复位、闹钟随之丢失，
+> 那种情况只能等来电后按一次电源键。日常"电网停电"（手机电池还在）不受影响。
 
 ### trigger 的两条硬规则（血泪）
 

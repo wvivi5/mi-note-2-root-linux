@@ -42,6 +42,7 @@
 | 拿 root | `modprobe_path` 指向自己的脚本 → `execve()` 一个 magic 非法的 4 字节文件（`trigger`）→ 内核 `request_module()` 以 **uid 0** 执行该脚本 |
 | 免 leak | 不需要泄露 `current`、不需要破 KASLR、不需要改 `addr_limit` |
 | 持久化 | Termux:Boot（App，无需 root）开机广播 → 自动重跑漏洞链 → 自动拉起 Linux sshd(8022) |
+| 通电自启 | **PMIC RTC 闹钟**（`/dev/rtc0` + `RTC_WKALM_SET`）：**已端到端实测**——`reboot -p` 关机后，闹钟到点把手机自己开机回来。按 RTC 自身 24h 时钟每 30 分钟（`:00`/`:30`）轮询，**不看日期**。`oem off-mode-charge` 无效但不影响 |
 | 验证 | 冷启动后 `ssh -p 8022 root@<ip>` → `Ubuntu 22.04.5 LTS`、`uid=0(root)`、无需开屏 |
 
 **与"写分区持久化"的区别**：本方案一个字节都不写验签分区，全部落在 `/data`（App 私有目录 +
