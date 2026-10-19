@@ -477,6 +477,7 @@ MIUI 的"一键清理"、`am force-stop`、低内存杀手都可能干掉我们�
 | 冷启动后 8022 不亮，也看不出钩子跑没跑 | `adb logcat -s n2boot` —— 钩子会把关键行镜像到 logcat（`N2 ...`），能直接看到走到哪一步、守卫是否放行 |
 | 8022 起不来，`/data/local/tmp/boot.log` 里有 `kernel guard` 字样 | 这台机器的内核/ROM 与 exploit 地址表不匹配，守卫**故意**跳过了 root 链（避免无限重启）。先 `collect-info.ps1` 确认，再决定是否重算偏移或 `-ForceKernel` |
 | 改了载荷但不想重启 | `.\device\rerun.ps1 -Serial <SN>` |
+| **想在 Linux 里跑 Docker** | **内核不允许，装上也起不来**。`docker.io` 能 apt 装上，但 `dockerd` 启动即 SIGSEGV；手工 `runc` 也死在 `mountpoint for devices not found`（内核没有 `devices` cgroup 控制器，也没有 UTS / IPC / user namespace、overlayfs、NAT 模块）。完整证据与替代方案见 [`../DOCKER_VERDICT.md`](../DOCKER_VERDICT.md)。要跑服务就直接在 chroot 里装，自启用现有开机链 |
 | 忘了密码 / 想关掉密码登录 | ssh 用密钥进去后 `passwd root` 改密码（不会被开机覆盖，因为有 `/root/.n2-pw-set`）；要彻底禁用就 `passwd -l root` |
 | ssh 报 `Permission denied (publickey)` 但密码是对的 | 检查服务器是否真开了密码登录：`ps -ef \| grep 'sshd -p 8022'` 应看到 `PasswordAuthentication=yes`；看门狗拉起来的 sshd 也带这些参数 |
 

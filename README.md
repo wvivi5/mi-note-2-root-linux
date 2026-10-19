@@ -29,6 +29,13 @@ ssh 进去的 Linux 小盒子 —— 这就是这个仓库的全部内容。
 —— 详见 [`ROOT_VERDICT.md`](ROOT_VERDICT.md)。所以走的是"**效果等同永久 root**、
 但一个验签分区都不写"的路线。
 
+### 那能跑 Docker 吗？
+
+**不能**，而且是内核编译期就砍掉的，用户态绕不过去 —— 详见 [`DOCKER_VERDICT.md`](DOCKER_VERDICT.md)。
+一句话版：`docker.io` 能 apt 装上，但 `dockerd` 启动即 SIGSEGV，手工 `runc` 也死在
+`mountpoint for devices not found`（内核没有 `devices` cgroup 控制器，也没有 UTS / IPC / user namespace，
+更没有 overlayfs 和 NAT 模块）。实际要跑服务，就直接在 chroot 里装、用现有开机链做自启。
+
 ---
 
 ## 快速开始
@@ -74,7 +81,7 @@ device/                       部署与运维脚本（PowerShell + 手机侧 sh�
   termux-bootstrap.tar        Termux 离线前缀（Release 附件）
 exploit/note2-root.c          漏洞利用源码（含本机内核符号量的全过程）
 termux/*.apk                  Termux + Termux:Boot
-docs/                         移植说明与踩坑记录（PLAN.md / ROOT_VERDICT.md / device README）
+docs/                         移植说明与踩坑记录（PLAN.md / ROOT_VERDICT.md / DOCKER_VERDICT.md / device README）
 ```
 
 **Release 附件**（超 GitHub 100MB 单文件上限，单独下载）：
