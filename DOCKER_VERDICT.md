@@ -5,11 +5,18 @@
 
 ## 结论
 
-> **Docker 能装上，但绝对跑不起来 —— 原因是内核编译时就把容器必需的部件砍掉了，用户态无法绕过。**
+> **① 原生 Docker（`dockerd` + `runc`）在这台机器上跑不起来 —— 内核编译时就把容器必需的部件砍掉了，用户态无法绕过。**
 >
 > - `apt-get install docker.io` → **成功**（docker.io 29.1.3 + containerd 2.2.1 + runc 1.3.4）
 > - `dockerd` 启动即 **SIGSEGV**（panic，连它自己报错的那条路径都崩了）
 > - 手工改用 `runc` 直接跑容器，把能改的配置全改完之后，仍然死在 **`mountpoint for devices not found`**
+>
+> **② 但是 —— 用 `udocker` 能正常跑 Docker 镜像，已端到端实测跑通（见下面「✅ 可行方案：udocker」）。**
+>
+> - 它用 PRoot（ptrace）做"用户态 chroot"，**完全不需要 namespace / cgroup / overlayfs**
+> - 实测：`hello-world`、`alpine`、`busybox` 都能跑；容器启动开销 **222 ms**；
+>   `--publish=18080:8080` 端口映射从容器外 `curl` 通（`udocker → proot-arm64 -p 8080:18080 → httpd`）
+> - Docker Hub 在本网络被墙，配一个国内镜像源即可（脚本会自动挑）
 
 ## 实测时间线（每一步都是现场跑的）
 
@@ -46,17 +53,84 @@
 
 **顺带说明**：`dockerd` 的 panic 并不是"配置没调对"，而是它拿不到这些内核能力后，在错误退出路径上自己崩了 —— 换任何参数组合都不会好。
 
-## 那实际上能用什么
+## ✅ 可行方案：udocker（本机已实测跑通）
 
-1. **就在现在的 chroot 里跑（推荐）**
-   Ubuntu 22.04 完整 apt 生态，sshd / nginx / python / 数据库都能直接装、直接跑。
-   需要守护进程 + 自启的话，仓库已有的开机链加一行就行（不需要 Docker 的进程管理）。
-2. **把镜像解包当 chroot 用**
-   在电脑上 `docker save` 或直接取镜像层 tar，解包出的 rootfs 丢进 chroot 就能跑。
-   很多单服务镜像这样就能用（代价：没有隔离、没有端口映射，网络就是手机本身）。
-3. **proot（A 线）**
-   能跑别的发行版 rootfs，不依赖内核 namespace/cgroup；但只是 ptrace 模拟，性能有损失，同样是"伪隔离"。
-4. **真要 Docker 生态** ⇒ 换一台能跑 Docker 的机器（x86 小主机 / 刷了 Armbian 的盒子）。
+**是什么**：[udocker](https://github.com/indigo-dc/udocker)（INDIGO-DataCloud 出品）是一个用
+**PRoot / Fakechroot** 做"用户态 chroot"的 Docker 镜像运行器。官方原话：
+*"两个执行引擎基于路径名翻译（pathname translation），**不依赖 user namespace 等内核特性**"* ——
+所以它正好绕开我们缺的那一堆（devices cgroup / UTS·IPC·user ns / overlayfs）。
+
+一键安装脚本：[`device/udocker-setup.sh`](device/udocker-setup.sh)（幂等，可对每台机器跑）
+
+```sh
+# 在 Linux chroot 里（root）
+sh /root/udocker-setup.sh     # 装依赖 / 装 udocker / 挑镜像源 / 写配置 / 自检
+```
+
+### 实测结果
+
+| 项目 | 结果 |
+|------|------|
+| `udocker --allow-root install`（下载 PRoot 后端） | ✅ udockertools 1.2.11 |
+| `udocker pull hello-world` + `create` + `run` | ✅ 完整输出，`executing: hello` |
+| `udocker pull alpine` + `run /bin/sh -c ...` | ✅ `ID=alpine`、`uid=0(root)`、`nproc=4` |
+| 容器启动开销（`/bin/echo hi`） | **222 ms** |
+| PRoot 开销（极端 syscall 负载：`seq 1 200000 \| wc -l`） | 355 ms vs 原生 15 ms（≈23×，**最坏情况**） |
+| `--publish` 端口映射 | ✅ `--publish=18080:8080` + busybox `httpd`，容器外 `curl` 返回 `HTTP 404`（服务确实在监听） |
+
+### 两个"坑"（都已解决）
+
+1. **udocker 默认拒绝以 root 运行**（因为它没有隔离）。官方开关就是 **`--allow-root`**
+   （源码 `udomain/umain.py` 里 `--allow-root` / `GEN_OPT`）。脚本已写好 `~/.bashrc` 别名。
+2. **Docker Hub 在本网络被墙**（`registry-1.docker.io:443` 连接被重置）。
+   udocker 支持 `--registry=<url>`，也可写进 `~/.udocker/udocker.conf`：
+   ```ini
+   [DEFAULT]
+   dockerio_registry_url = https://docker.m.daocloud.io
+   ```
+   实测本机能通的镜像源：`docker.m.daocloud.io`(推荐) / `docker.1panel.live` /
+   `docker.xuanyuan.me` / `public.ecr.aws` / `registry.cn-hangzhou.aliyuncs.com`。
+   ⚠️ 用户配置里**只放覆盖的键**，不要整份拷 `etc/udocker.conf`（里面的 `%(topdir)s` 会触发插值递归而报错）。
+
+### 用法
+
+```sh
+udocker pull nginx:alpine                       # 从镜像源拉
+udocker create --name=web nginx:alpine          # 展开成一个容器
+udocker run --rm --publish=8080:80 web          # 跑起来，主机 8080 -> 容器 80
+udocker run --rm -v /srv/www:/usr/share/nginx/html web
+udocker ps / udocker images / udocker rm -f web
+```
+
+### 限制（必须知道）
+
+- **没有隔离**：容器共享主机网络与 PID，容器里的 root 能改到主机文件 ⇒ **只跑可信镜像**；
+- **没有 `-d` 后台参数** ⇒ 常驻服务用 `nohup`/`setsid` 起，或接进开机自启链；
+- 没有 BuildKit（不能 `docker build`）、没有 compose、没有卷/网络对象；
+- PRoot 是 ptrace 翻译 ⇒ syscall 密集的负载会明显变慢（普通程序没这么夸张）。
+- 因为我们是**真的 root**（`--allow-root`），容器内绑 1024 以下端口是可以的（PRoot 那个
+  "不能监听特权端口"的限制只针对非 root 用户场景）。
+
+### 想连真 `docker` 命令行都用上？
+
+社区另有 **`udockerd`**（2026-08）—— *"Docker Engine API-compatible daemon backed by udocker"*，
+它把 udocker 包装成一个 **兼容 Docker Engine API 的守护进程**，于是 `docker ps` / `docker run` 这些
+命令能直接连它（`DOCKER_HOST=...`）。同样不需要 root/namespace/cgroup。
+代价：需要 Python 3.12+（本机是 3.10，得另装或用它自带的 Cosmopolitan 单文件版），
+且功能子集（无 BuildKit / 无 compose；网络等同 `--net=host`）。
+
+## 那实际上还有什么选择
+
+1. **udocker（首选，见上）** —— 真的能跑 Docker 镜像，已经跑通。
+2. **就在 chroot 里直接装**
+   Ubuntu 22.04 完整 apt 生态，sshd / nginx / python / 数据库都能直接装、直接跑；
+   要守护进程 + 自启，用现有开机链加一行（不需要 Docker 的进程管理，也比 PRoot 快）。
+3. **把镜像解包当 chroot 用**（udocker 的极简版）
+   取镜像层 tar 解开丢进 chroot（代价：没有端口映射、没有镜像管理，就是 udocker 手工版）。
+4. **QEMU 虚拟机 + 真 dockerd**（要 compose / 真隔离才值得）
+   aarch64 客户机（`qemu-system-aarch64`）；⚠️ 网上教程大多用 `qemu-system-x86_64`,
+   那是 ARM 手机上最慢的组合。无 KVM ⇒ 纯 TCG，慢。
+5. **真要完整 Docker 生态** ⇒ 换一台能跑 Docker 的机器（x86 小主机 / 刷了 Armbian 的盒子）。
 
 ## 社区结论（Termux 官方 + 社区实践，2026-10 调研）
 
@@ -86,20 +160,23 @@
 | **QEMU 虚拟机 + 真 dockerd**（`sulthonzh/android-docker-qemu`、`luisdavim/termux-qemu-docker`、`cyberkernelofficial/docker-in-termux`） | ✅ 真 dockerd + compose | Termux + QEMU，**不碰内核** | ✅ | 无 KVM ⇒ 纯 TCG 模拟，**慢** |
 | **proot-distro**（Termux 官方维护；5.x 起能直接从 Docker Hub 拉 OCI 镜像、从 Dockerfile 构建镜像） | ❌ 没有 daemon | ptrace | ✅ | 慢、无隔离 |
 | LXC（需 root + cgroup + systemd） | 半（能跑容器，不是 Docker 生态） | 内核 cgroup / namespace | ❌ 同样缺 | — |
+| **udocker**（PRoot/Fakechroot，用户态 chroot） | ❌ 没有 daemon，但**镜像能正常拉、正常跑** | 只要 root | ✅ **已实测跑通** | PRoot 有 ptrace 开销、无隔离 |
 
-**对本机的建议：**
+**对本机的结论：**
 
-1. 只是要 **Docker 镜像里的东西能用** ⇒ 把镜像**解包成目录**，直接 `chroot` 跑（原生速度，
-   而且我们已经有 root + chroot）—— 这是最省事、最快的。
-2. 要**真 Docker / compose** ⇒ 用 QEMU 起一个 **aarch64** 的 Alpine/Debian 虚拟机，里面跑真 dockerd，
-   再用 Termux:Boot 自启（社区几个项目就是这么做的）。
-   ⚠️ 注意：网上教程大多用 `qemu-system-x86_64` 客户机，那是 ARM 手机上**最慢**的组合；
-   用 **aarch64 客户机**（`qemu-system-aarch64`）是同架构翻译，快得多。
+1. 要"**Docker 镜像能用**" ⇒ **用 udocker**（`device/udocker-setup.sh`），已实测跑通，
+   比 QEMU 虚拟机快得多、比 proot-distro 直接。
+2. 要"**服务能跑**" ⇒ 直接在 chroot 里 apt 装（原生速度、最省事）。
+3. 要"**真 Docker / compose / 隔离**" ⇒ 只有 QEMU 虚拟机（aarch64 客户机），接受它慢。
+4. 要"**改内核后原生跑**" ⇒ 本机不行（BL 锁死）。
 
-## 已做的清理
+## 已做的清理 / 留在机器上的东西
 
 - 测试用的 cgroup 挂载点**已全部 umount**（`/proc/self/mountinfo` 里已无 cgroup 条目）
 - 测试文件留在 `/root/tc`（可删）
+- **`udocker` 已装好并留在机器上**（`/usr/local/bin/udocker`、后端在 `/root/.udocker/bin/`、
+  镜像源配置在 `/root/.udocker/udocker.conf`）；测试容器 `hw` / `alp` / `alp2` / `alp3` / `web` / `hello`
+  还在（`udocker rm -f <名字>` 可删）。要清干净：`rm -rf /root/.udocker` + `pip3 uninstall udocker`
 - `docker.io` / `containerd` / `runc` **保留**（顺带装上的 `iptables` 本身有用）；
   不需要时：`apt-get purge -y docker.io containerd runc && rm -rf /var/lib/docker`
 

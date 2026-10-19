@@ -31,10 +31,17 @@ ssh 进去的 Linux 小盒子 —— 这就是这个仓库的全部内容。
 
 ### 那能跑 Docker 吗？
 
-**不能**，而且是内核编译期就砍掉的，用户态绕不过去 —— 详见 [`DOCKER_VERDICT.md`](DOCKER_VERDICT.md)。
-一句话版：`docker.io` 能 apt 装上，但 `dockerd` 启动即 SIGSEGV，手工 `runc` 也死在
-`mountpoint for devices not found`（内核没有 `devices` cgroup 控制器，也没有 UTS / IPC / user namespace，
-更没有 overlayfs 和 NAT 模块）。实际要跑服务，就直接在 chroot 里装、用现有开机链做自启。
+**原生 Docker 跑不了，但用 `udocker` 能正常跑 Docker 镜像（已实测跑通）。**
+
+- 原生不行：`docker.io` 能 apt 装上，但 `dockerd` 启动即 SIGSEGV，手工 `runc` 也死在
+  `mountpoint for devices not found`（内核没有 `devices` cgroup 控制器，也没有 UTS / IPC / user namespace，
+  更没有 overlayfs 和 NAT 模块）—— 详见 [`DOCKER_VERDICT.md`](DOCKER_VERDICT.md)。
+- **udocker 可以**：它用 PRoot 做"用户态 chroot"，不依赖那些内核特性。
+  一键脚本 [`device/udocker-setup.sh`](device/udocker-setup.sh)；实测跑通
+  `hello-world` / `alpine` / `busybox`，容器启动 ~222ms，`--publish=18080:8080` 端口映射有效。
+  代价：**没有隔离**（只跑可信镜像）、没有 `-d`、没有 compose。
+
+要跑服务，也可以直接在 chroot 里 apt 装（原生速度）。
 
 ---
 
@@ -75,6 +82,7 @@ device/                       部署与运维脚本（PowerShell + 手机侧 sh�
   make-package.ps1            打出离线开箱包（含 adb/APK/rootfs）
   *.bat                       双击启动器
   boot_root_payload.sh        设备上的 root 载荷（密码、sshd、看门狗、oom、日志外带）
+  udocker-setup.sh            在 Linux 里一键装 udocker（跑 Docker 镜像，见 DOCKER_VERDICT.md）
   00-startup.sh               开机钩子（内核守卫、Termux:Boot 入口）
   p1.sh / p2.sh / p2wrap.sh   部署期 stage-1 / stage-2 / root 包装
   note2-rootfs.tar.gz         Ubuntu 22.04 模板（Release 附件，含 openssh-server）
