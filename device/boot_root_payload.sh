@@ -118,6 +118,29 @@ if [ -f $STAGE/00-startup.sh ] && [ -d $H/.termux/boot ]; then
     fi
 fi
 
+# --- 0c. Install this payload as the copy the boot hook will run next time ----
+# The hook does `cp $STAGE/rootcmd.sh $HOME/n2/rootcmd.sh` and runs the HOME
+# copy, so pushing only into staging should be enough.  On 85126a4c it was not:
+# the fix pushed at 14:32 ran once (via rerun's trigger) and after the next
+# reboot the OLD payload ran again -- which makes a real fix look like a failed
+# one.  So the payload also installs itself, wherever it was started from.
+# rename(2), not in-place overwrite: this script may be the one being executed.
+SELF=$(readlink -f "$0" 2>/dev/null)
+[ -n "$SELF" ] || SELF=$0
+case "$SELF" in
+    */n2/rootcmd.sh) ;;   # already the boot copy
+    *)
+        if [ -f "$SELF" ] && [ -d $H/n2 ]; then
+            A=$(cat $STAGE/.appuid 2>/dev/null | tr -dc 0-9)
+            [ -n "$A" ] || A=$(ls -nd $H/n2 2>/dev/null | awk '{print $3}')
+            cp -f "$SELF" $H/n2/rootcmd.sh.new 2>>$LOG
+            chmod 755 $H/n2/rootcmd.sh.new 2>>$LOG
+            [ -n "$A" ] && chown "$A:$A" $H/n2/rootcmd.sh.new 2>>$LOG
+            mv -f $H/n2/rootcmd.sh.new $H/n2/rootcmd.sh 2>>$LOG
+            echo "--- payload self-installed to \$HOME/n2/rootcmd.sh (from $SELF) ---" >> $LOG
+        fi ;;
+esac
+
 # --- 1. Get a working Linux rootfs -----------------------------------------
 # Preferred: the pre-baked template (Ubuntu 22.04 + openssh-server already in
 # it) -> installs fully offline. Fallback: the plain Ubuntu base tarball, in
