@@ -1,49 +1,270 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-n2wifi —— 通过 ssh（在 Ubuntu chroot 里）管理 Android 侧的 WiFi 配置
+"""n2wifi -- manage Android Wi-Fi from a shell, without touching the screen.
 
-背景：
-  手机的 WiFi 由 Android 的 wpa_supplicant 管理，不在 chroot 里。
-  Android 8 把保存的 WiFi 保存在
-      /data/misc/wifi/WifiConfigStore.xml
-  改动它之后，重启 Android 框架（system_server）就会重新加载并自动连接。
-
-  为什么不走 wpa_supplicant 的控制口：本机 MIUI 的 supplicant 对第三方
-  客户端不发回包（实测 PING/STATUS 全超时），所以走配置存储这条正统路线。
-
-用法：
-  n2wifi list                     列出已保存的 SSID
-  n2wifi status                   当前连接状态
-  n2wifi scan                     扫描周边 WiFi（信号/频段/信道/加密）
-  n2wifi scan --all               同上，但列出每个 BSSID（不过滤同名）
-  n2wifi join  <SSID> <密码>      写入并让框架重新加载（默认，推荐）
-  n2wifi add   <SSID> <密码>      只写入，不重启框架（下次重启生效）
-  n2wifi add   <SSID> --open      写一个开放网络
-  n2wifi del   <SSID>             删除某个已保存网络
-  n2wifi apply                    让 Android 框架重新加载配置（软重启，约 40 秒）
-  n2wifi backups                  列出备份
-  n2wifi revert [备份文件]        用备份恢复（不给文件则用最新的）
-
-注意：
-  * 需要 root（在 chroot 里就是 root）
-  * apply 会重启 Android 框架；chroot 里的 sshd 不受影响，但 WiFi 会短暂断开
-  * 写入前会自动备份到 WifiConfigStore.xml.n2bak-<时间戳>
+Run `n2wifi --help` for usage.
+Docs: README.md (English) / README.zh-CN.md (Chinese).
 """
 
+import glob
 import os
 import re
-import sys
-import glob
-import time
 import shutil
-import unicodedata
 import subprocess
+import sys
+import time
+import unicodedata
 
+VERSION = "1.0.0"
+
+# --------------------------------------------------------------------------
+# i18n
+# --------------------------------------------------------------------------
+
+M = {}
+
+M["en"] = {
+    "usage": """n2wifi {version} -- manage Android Wi-Fi from a shell (no screen needed)
+
+Usage:
+  n2wifi list                    list saved networks
+  n2wifi status                  current SSID / signal / band / IP
+  n2wifi ip                      print the current IPv4 address (for scripts)
+  n2wifi scan                    scan nearby APs (signal/band/channel/security)
+  n2wifi scan --all              same, but list every BSSID (no merging)
+  n2wifi join  <SSID> <pass>     add + reload the framework now (recommended)
+  n2wifi add   <SSID> <pass>     add only (takes effect on next reload/reboot)
+  n2wifi add   <SSID> --open     add an open network
+  n2wifi del   <SSID>            remove a saved network
+  n2wifi apply                   make Android reload the config (~40 s)
+  n2wifi backups                 list automatic backups
+  n2wifi revert [file]           restore a backup (default: the newest)
+
+Options:
+  --lang en|zh                   output language (default: from LANG, else en)
+  -h, --help                     this help
+  -V, --version                  print version
+
+Notes:
+  * must run as root (uid 0)
+  * config store: /data/misc/wifi/WifiConfigStore.xml          (Android 7-10)
+                  /data/misc/apexdata/com.android.wifi/...      (Android 11+)
+    both are checked automatically; set N2WIFI_XML to override
+  * every write is backed up first to WifiConfigStore.xml.n2bak-<timestamp>
+  * `apply` restarts system_server; netd and wpa_supplicant keep running, so
+    Wi-Fi and ssh usually survive -- a few ROMs reboot instead (back in 1-2 min)
+  * docs: README.md / README.zh-CN.md""",
+
+    "not_root": "must run as root (uid 0)",
+    "store_missing": "cannot find the Wi-Fi config store.\n"
+                     "  looked for: {paths}\n"
+                     "  is this an Android device? set N2WIFI_XML=/path/to/WifiConfigStore.xml",
+    "no_iw": "iw not found. Install it (apt-get install -y iw) or keep /system/bin/iw available",
+    "scan_timeout": "scan timed out (is wlan0 up?)",
+    "scan_fail": "scan failed: {err}",
+    "scan_none": "no AP found (is Wi-Fi enabled?)",
+    "scan_head": "{aps} APs, {ssids} distinct SSIDs:",
+    "col_signal": "signal",
+    "col_band": "band",
+    "col_chan": "chan",
+    "col_sec": "security",
+    "col_bssid": "BSSID",
+    "col_ssid": "SSID",
+    "tag_current": "connected",
+    "tag_saved": "saved",
+    "tag_assoc": "associated",
+    "hidden": "<hidden>",
+    "scan_hint": 'add: n2wifi add "<SSID>" "<password>"    switch now: n2wifi join "<SSID>" "<password>"',
+    "sec_open": "open",
+    "no_saved": "(no saved networks)",
+    "saved_list": "Saved Wi-Fi ({n}):",
+    "cur_mark": "  <- connected",
+    "status_ssid": "Connected : {v}",
+    "status_signal": "Signal    : {v}",
+    "status_band": "Band      : {v}",
+    "status_ip": "IP        : {v}",
+    "status_saved": "Saved     : {n} -> {list}",
+    "not_connected": "(not connected)",
+    "apply_no_ss": "system_server not found -- is the Android framework running?",
+    "apply_start": "reloading Android Wi-Fi config (restarting system_server, pid={pid}) ...",
+    "apply_hint1": "  note: netd / wpa_supplicant keep running, so Wi-Fi and ssh should stay up;",
+    "apply_hint2": "        a few ROMs treat this as a crash and reboot -- it comes back in 1-2 min.",
+    "apply_kill_fail": "cannot kill system_server: {e}",
+    "apply_back": "[ok] system_server is back (pid={pid}, {sec}s)",
+    "apply_late": "[!] no new system_server within 180 s (the phone may have rebooted; it will come back)",
+    "selfcheck_fail": "self-check failed ({e}); nothing was written",
+    "ssid_empty": "SSID must not be empty",
+    "need_psk": "password required (or use --open)",
+    "psk_len": "WPA2 passphrase must be 8-63 characters",
+    "already": 'SSID already saved: {ssid}  (to change the password: n2wifi del "{ssid}")',
+    "write_verify_fail": "verification after write failed; run `n2wifi revert` (backup: {b})",
+    "added": "[ok] added: {ssid}  ({old} -> {new} networks)",
+    "backup_line": "     backup: {b}",
+    "add_only_note": "     note: written to disk only; run `n2wifi apply` to make Android use it",
+    "no_such_ssid": "no such SSID: {ssid}",
+    "del_verify_fail": "verification after delete failed; run `n2wifi revert` (backup: {b})",
+    "deleted": "[ok] deleted: {ssid}  ({n} left)",
+    "no_backups": "no backups",
+    "no_such_backup": "backup not found: {p}",
+    "bad_backup": "that backup looks incomplete; refusing to restore",
+    "reverted": "[ok] restored from {p}",
+    "apply_note": "     make Android use it: n2wifi apply",
+    "usage_add": "usage: n2wifi add <SSID> <password>   or   n2wifi add <SSID> --open",
+    "usage_join": "usage: n2wifi join <SSID> <password>   or   n2wifi join <SSID> --open",
+    "usage_del": "usage: n2wifi del <SSID>",
+    "unknown_cmd": "unknown command: {cmd}\n\n{usage}",
+    "wep_unsupported": "WEP is not supported",
+}
+
+M["zh"] = {
+    "usage": """n2wifi {version} —— 不开屏，从命令行管理 Android 的 WiFi
+
+用法：
+  n2wifi list                    列出已保存的网络
+  n2wifi status                  当前 SSID / 信号 / 频段 / IP
+  n2wifi ip                      只打印当前 IPv4（给脚本用）
+  n2wifi scan                    扫描周边 AP（信号/频段/信道/加密）
+  n2wifi scan --all              同上，但按 BSSID 全列（不做同名合并）
+  n2wifi join  <SSID> <密码>      写入 + 立刻重载框架（推荐）
+  n2wifi add   <SSID> <密码>      只写入（下次重载/重启才生效）
+  n2wifi add   <SSID> --open      加一个开放网络
+  n2wifi del   <SSID>             删除某个已保存的网络
+  n2wifi apply                    让 Android 重新加载配置（约 40 秒）
+  n2wifi backups                  列出自动备份
+  n2wifi revert [文件]            用备份恢复（默认最新的）
+
+选项：
+  --lang en|zh                    输出语言（默认看 LANG，都没有就用英文）
+  -h, --help                      帮助
+  -V, --version                   版本
+
+注意：
+  * 必须 root（uid 0）
+  * 配置存储：/data/misc/wifi/WifiConfigStore.xml         （Android 7~10）
+              /data/misc/apexdata/com.android.wifi/...     （Android 11+）
+    两个路径会自动找；也可以用环境变量 N2WIFI_XML 指定
+  * 每次写入前自动备份成 WifiConfigStore.xml.n2bak-<时间戳>
+  * apply 会重启 system_server；netd 和 wpa_supplicant 不停，所以 WiFi 和 ssh
+    通常不会断 —— 个别 ROM 会当成崩溃整机重启（1~2 分钟自己回来）
+  * 文档：README.md / README.zh-CN.md""",
+
+    "not_root": "请用 root 运行（uid 0）",
+    "store_missing": "找不到 WiFi 配置存储。\n"
+                     "  找过：{paths}\n"
+                     "  这台是 Android 吗？可以用 N2WIFI_XML=/path/to/WifiConfigStore.xml 指定",
+    "no_iw": "找不到 iw。装一个（apt-get install -y iw），或保证 /system/bin/iw 在",
+    "scan_timeout": "扫描超时（wlan0 没起来？）",
+    "scan_fail": "扫描失败：{err}",
+    "scan_none": "没扫到任何 AP（WiFi 开了吗？）",
+    "scan_head": "扫到 {aps} 个 AP（{ssids} 个不同 SSID）：",
+    "col_signal": "信号",
+    "col_band": "频段",
+    "col_chan": "信道",
+    "col_sec": "加密",
+    "col_bssid": "BSSID",
+    "col_ssid": "SSID",
+    "tag_current": "当前",
+    "tag_saved": "已保存",
+    "tag_assoc": "associated",
+    "hidden": "<隐藏>",
+    "scan_hint": '加网络：n2wifi add "<SSID>" "<密码>"     立即用：n2wifi join "<SSID>" "<密码>"',
+    "sec_open": "开放",
+    "no_saved": "（没有已保存的网络）",
+    "saved_list": "已保存的 WiFi（{n} 个）：",
+    "cur_mark": "  <- 当前连接",
+    "status_ssid": "当前连接 : {v}",
+    "status_signal": "信号     : {v}",
+    "status_band": "频段     : {v}",
+    "status_ip": "IP       : {v}",
+    "status_saved": "已保存   : {n} 个 -> {list}",
+    "not_connected": "（未连接）",
+    "apply_no_ss": "没找到 system_server，Android 框架是不是没起来？",
+    "apply_start": "正在让 Android 重新加载 WiFi 配置（重启 system_server，pid={pid}）...",
+    "apply_hint1": "  提示：netd / wpa_supplicant 不停，WiFi 和 ssh 应该不会断；",
+    "apply_hint2": "        个别 ROM 会把它当成崩溃而整机重启，那样 1~2 分钟后自动回来。",
+    "apply_kill_fail": "杀 system_server 失败：{e}",
+    "apply_back": "[ok] system_server 已重新起来（pid={pid}，用了 {sec} 秒）",
+    "apply_late": "[!] 180 秒内没看到新的 system_server（可能整机重启了，等它自己回来）",
+    "selfcheck_fail": "自检失败（{e}），已放弃写入，原文件没动",
+    "ssid_empty": "SSID 不能为空",
+    "need_psk": "需要密码（或用 --open）",
+    "psk_len": "WPA2 密码必须是 8~63 个字符",
+    "already": '这个 SSID 已经保存过了：{ssid}（要改密码先 n2wifi del "{ssid}"）',
+    "write_verify_fail": "写入后校验失败，用 `n2wifi revert` 恢复（备份：{b}）",
+    "added": "[ok] 已写入：{ssid}（原有 {old} 个 -> 现在 {new} 个）",
+    "backup_line": "     备份：{b}",
+    "add_only_note": "     注意：现在只是写进文件；要让 Android 生效请跑 `n2wifi apply`",
+    "no_such_ssid": "没找到这个 SSID：{ssid}",
+    "del_verify_fail": "删除后校验失败，用 `n2wifi revert` 恢复（备份：{b}）",
+    "deleted": "[ok] 已删除：{ssid}（剩 {n} 个）",
+    "no_backups": "没有备份",
+    "no_such_backup": "备份不存在：{p}",
+    "bad_backup": "这个备份看起来不完整，拒绝恢复",
+    "reverted": "[ok] 已从备份恢复：{p}",
+    "apply_note": "     让 Android 生效：n2wifi apply",
+    "usage_add": "用法：n2wifi add <SSID> <密码>   或   n2wifi add <SSID> --open",
+    "usage_join": "用法：n2wifi join <SSID> <密码>   或   n2wifi join <SSID> --open",
+    "usage_del": "用法：n2wifi del <SSID>",
+    "unknown_cmd": "未知命令：{cmd}\n\n{usage}",
+    "wep_unsupported": "不支持 WEP",
+}
+
+
+def _lang_from_env():
+    for k in ("N2WIFI_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
+        v = (os.environ.get(k) or "").strip().lower()
+        if v.startswith("zh"):
+            return "zh"
+        if v.startswith("en"):
+            return "en"
+    return "en"
+
+
+LANG = _lang_from_env()
+
+
+def t(key, **kw):
+    s = M.get(LANG, {}).get(key)
+    if s is None:
+        s = M["en"].get(key, key)
+    return s.format(**kw) if kw else s
+
+
+def usage():
+    return t("usage").format(version=VERSION)
+
+
+# --------------------------------------------------------------------------
+# where the config lives
+# --------------------------------------------------------------------------
+
+# A chroot has its own "/" so Android paths are only reachable through
+# /proc/1/root.  From an Android root shell /proc/1/root IS "/", so trying both
+# covers every setup.
 ANDROID_ROOT = "/proc/1/root"
-WIFI_DIR = ANDROID_ROOT + "/data/misc/wifi"
-XML = WIFI_DIR + "/WifiConfigStore.xml"
+
+CANDIDATES = [
+    # Android 7 - 10
+    "/data/misc/wifi/WifiConfigStore.xml",
+    # Android 11+ (Wi-Fi module moved into an APEX)
+    "/data/misc/apexdata/com.android.wifi/WifiConfigStore.xml",
+]
+
 UID, GID = 1000, 1000  # Android system
+
+
+def resolve_store():
+    override = os.environ.get("N2WIFI_XML")
+    if override:
+        return override
+    for p in CANDIDATES:
+        for cand in (p, ANDROID_ROOT + p):
+            if os.path.exists(cand):
+                return cand
+    return ANDROID_ROOT + CANDIDATES[0]
+
+
+XML = resolve_store()
 
 TEMPLATE = """<Network>
 <WifiConfiguration>
@@ -98,6 +319,10 @@ NET_RE = re.compile(r"<Network>.*?</Network>", re.S)
 SSID_RE = re.compile(r'<string name="SSID">(.*?)</string>', re.S)
 
 
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
 def die(msg, code=1):
     print("error: " + msg, file=sys.stderr)
     sys.exit(code)
@@ -110,13 +335,14 @@ def xml_escape(s):
 
 def read_text():
     if not os.path.exists(XML):
-        die("找不到 " + XML + "（Android 没在这个路径放配置？）")
+        die(t("store_missing", paths="\n             ".join(
+            [XML] + [ANDROID_ROOT + p for p in CANDIDATES])))
     with open(XML, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
 
 
 def decode_ssid(raw):
-    """<SSID> 里可能是 &quot;名称&quot; 或者十六进制"""
+    """<SSID> may be &quot;name&quot; or a hex blob."""
     s = (raw.replace("&quot;", '"').replace("&amp;", "&")
             .replace("&lt;", "<").replace("&gt;", ">")).strip()
     if re.fullmatch(r"([0-9a-fA-F]{2})+", s):
@@ -130,7 +356,7 @@ def decode_ssid(raw):
 
 
 def parse_networks(text):
-    """返回 [(ssid, block)]，只取 NetworkList 里的"""
+    """[(ssid, block)] for everything inside <NetworkList>"""
     i = text.find("<NetworkList>")
     j = text.find("</NetworkList>")
     if i < 0 or j < 0:
@@ -144,17 +370,23 @@ def parse_networks(text):
     return out
 
 
-def find_ssid_line(ssid):
-    """用于判断是否重复：按解码后的名字比较"""
-    return ssid
+def iw_cmd(args):
+    """Pick whichever iw is available: PATH, then the Android one."""
+    if shutil.which("iw"):
+        return ["iw"] + args
+    for cand in (ANDROID_ROOT + "/system/bin/iw", "/system/bin/iw"):
+        if os.path.exists(cand):
+            if cand.startswith(ANDROID_ROOT):
+                return ["chroot", ANDROID_ROOT, "/system/bin/iw"] + args
+            return [cand] + args
+    die(t("no_iw"))
 
 
 def current_connection():
     info = {}
     try:
-        out = subprocess.run(
-            ["chroot", ANDROID_ROOT, "/system/bin/iw", "dev", "wlan0", "link"],
-            capture_output=True, text=True, timeout=15).stdout
+        out = subprocess.run(iw_cmd(["dev", "wlan0", "link"]),
+                             capture_output=True, text=True, timeout=15).stdout
         m = re.search(r"SSID:\s*(.+)", out)
         if m:
             info["ssid"] = m.group(1).strip()
@@ -178,7 +410,7 @@ def current_connection():
 
 
 def dw(s):
-    """终端显示宽度：中文/全角算 2"""
+    """terminal display width (CJK = 2 cells)"""
     w = 0
     for ch in str(s):
         w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
@@ -225,23 +457,90 @@ def security_of(b):
         return "WPA"
     if b["privacy"]:
         return "WEP"
-    return "开放"
+    return t("sec_open")
+
+
+def backup():
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dst = XML + ".n2bak-" + ts
+    # two writes inside the same second must not clobber each other
+    n = 2
+    while os.path.exists(dst):
+        dst = XML + ".n2bak-" + ts + "-%d" % n
+        n += 1
+    shutil.copy2(XML, dst)
+    try:
+        os.chmod(dst, 0o600)
+        os.chown(dst, UID, GID)
+    except OSError:
+        pass
+    return dst
+
+
+def write_atomic(new_text):
+    tmp = XML + ".n2tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    os.chmod(tmp, 0o600)
+    try:
+        os.chown(tmp, UID, GID)
+    except OSError:
+        pass
+    # self-check: must still be valid XML with the expected structure
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.parse(tmp).getroot()
+        if root.tag != "WifiConfigStoreData":
+            raise ValueError("root tag = " + root.tag)
+        if not root.find("NetworkList"):
+            raise ValueError("no NetworkList")
+    except Exception as e:
+        os.unlink(tmp)
+        die(t("selfcheck_fail", e=e))
+    os.replace(tmp, XML)
+
+
+# --------------------------------------------------------------------------
+# commands: list / status / ip / scan
+# --------------------------------------------------------------------------
+
+def cmd_list():
+    nets = parse_networks(read_text())
+    if not nets:
+        print(t("no_saved"))
+        return
+    cur = current_connection().get("ssid")
+    print(t("saved_list", n=len(nets)))
+    for ssid, _ in nets:
+        mark = t("cur_mark") if cur and ssid == cur else ""
+        print("  " + ssid + mark)
+
+
+def cmd_status():
+    nets = parse_networks(read_text())
+    info = current_connection()
+    print(t("status_ssid", v=info.get("ssid", t("not_connected"))))
+    print(t("status_signal", v=info.get("signal", "-")))
+    print(t("status_band", v=info.get("freq", "-")))
+    print(t("status_ip", v=info.get("ip", "-")))
+    print(t("status_saved", n=len(nets), list=", ".join(s for s, _ in nets)))
+
+
+def cmd_ip():
+    ip = current_connection().get("ip")
+    if not ip:
+        die(t("not_connected"), 2)
+    print(ip.split("/")[0])
 
 
 def iw_scan():
-    """跑一次 iw scan，返回原始文本。优先用 chroot 自带的 iw。"""
-    if shutil.which("iw"):
-        cmd = ["iw", "dev", "wlan0", "scan"]
-    elif os.path.exists(ANDROID_ROOT + "/system/bin/iw"):
-        cmd = ["chroot", ANDROID_ROOT, "/system/bin/iw", "dev", "wlan0", "scan"]
-    else:
-        die("找不到 iw（chroot 里执行：apt-get install -y iw）")
     err = ""
-    for i in range(3):
+    for _ in range(3):
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+            p = subprocess.run(iw_cmd(["dev", "wlan0", "scan"]),
+                               capture_output=True, text=True, timeout=45)
         except subprocess.TimeoutExpired:
-            err = "扫描超时（wlan0 没起来？）"
+            err = t("scan_timeout")
             break
         if p.returncode == 0 and "BSS " in p.stdout:
             return p.stdout
@@ -249,7 +548,7 @@ def iw_scan():
         if "busy" not in err.lower():
             break
         time.sleep(2)
-    die("扫描失败：" + err)
+    die(t("scan_fail", err=err))
 
 
 def parse_scan(text):
@@ -289,7 +588,7 @@ def parse_scan(text):
 def cmd_scan(show_all=False):
     aps = parse_scan(iw_scan())
     if not aps:
-        print("（没扫到任何 AP）")
+        print(t("scan_none"))
         return
     cur = current_connection().get("ssid")
     saved = set(s for s, _ in parse_networks(read_text()))
@@ -298,25 +597,26 @@ def cmd_scan(show_all=False):
     else:
         best = {}
         for b in aps:
-            k = b["ssid"] or "<隐藏>"
+            k = b["ssid"] or t("hidden")
             if k not in best or (b["signal"] or -200) > (best[k]["signal"] or -200):
                 best[k] = b
         rows = sorted(best.values(), key=lambda b: -(b["signal"] or -200))
-    print("扫到 %d 个 AP（%d 个不同 SSID）：" % (len(aps), len(rows)))
-    hdr = pad("信号", 10) + pad("频段", 6) + pad("信道", 6) + pad("加密", 12)
+    print(t("scan_head", aps=len(aps), ssids=len(rows)))
+    hdr = (pad(t("col_signal"), 10) + pad(t("col_band"), 6)
+           + pad(t("col_chan"), 6) + pad(t("col_sec"), 12))
     if show_all:
-        hdr += pad("BSSID", 19)
-    print("  " + hdr + "SSID")
+        hdr += pad(t("col_bssid"), 19)
+    print("  " + hdr + t("col_ssid"))
     for b in rows:
-        name = b["ssid"] or "<隐藏>"
+        name = b["ssid"] or t("hidden")
         sig = ("%d dBm" % round(b["signal"])) if b["signal"] is not None else "-"
         tags = []
         if name == cur:
-            tags.append("当前")
+            tags.append(t("tag_current"))
         elif name in saved:
-            tags.append("已保存")
+            tags.append(t("tag_saved"))
         if b["associated"]:
-            tags.append("associated")
+            tags.append(t("tag_assoc"))
         tail = ("   [" + ",".join(tags) + "]") if tags else ""
         line = ("  " + pad(sig, 10) + pad(band_of(b["freq"]), 6)
                 + pad(chan_of(b["freq"]), 6) + pad(security_of(b), 12))
@@ -325,67 +625,12 @@ def cmd_scan(show_all=False):
         print(line + name + tail)
     if not show_all:
         print("")
-        print("加网络：n2wifi add \"<SSID>\" \"<密码>\"     立即用：n2wifi join \"<SSID>\" \"<密码>\"")
+        print(t("scan_hint"))
 
 
-def cmd_list():
-    text = read_text()
-    nets = parse_networks(text)
-    if not nets:
-        print("（没有已保存的网络）")
-        return
-    cur = current_connection().get("ssid")
-    print("已保存的 WiFi（%d 个）：" % len(nets))
-    for ssid, _ in nets:
-        mark = "  <- 当前连接" if cur and ssid == cur else ""
-        print("  " + ssid + mark)
-
-
-def cmd_status():
-    text = read_text()
-    nets = parse_networks(text)
-    info = current_connection()
-    print("当前连接 : %s" % info.get("ssid", "（未连接）"))
-    print("信号     : %s" % info.get("signal", "-"))
-    print("频段     : %s" % info.get("freq", "-"))
-    print("IP       : %s" % info.get("ip", "-"))
-    print("已保存   : %d 个 -> %s" % (len(nets), ", ".join(s for s, _ in nets)))
-
-
-def backup():
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    dst = XML + ".n2bak-" + ts
-    shutil.copy2(XML, dst)
-    try:
-        os.chmod(dst, 0o600)
-        os.chown(dst, UID, GID)
-    except OSError:
-        pass
-    return dst
-
-
-def write_atomic(new_text):
-    tmp = XML + ".n2tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(new_text)
-    os.chmod(tmp, 0o600)
-    try:
-        os.chown(tmp, UID, GID)
-    except OSError:
-        pass
-    # 自检：必须是合法 XML、且结构没被破坏
-    try:
-        import xml.etree.ElementTree as ET
-        root = ET.parse(tmp).getroot()
-        if root.tag != "WifiConfigStoreData":
-            raise ValueError("root tag = " + root.tag)
-        if not root.find("NetworkList"):
-            raise ValueError("no NetworkList")
-    except Exception as e:
-        os.unlink(tmp)
-        die("自检失败（%s），已放弃写入，原文件没动" % e)
-    os.replace(tmp, XML)
-
+# --------------------------------------------------------------------------
+# commands: add / del / apply / backups / revert
+# --------------------------------------------------------------------------
 
 def _set_str(blk, name, value_xml):
     pat = re.compile(r'(<string name="%s">).*?(</string>)' % re.escape(name), re.S)
@@ -410,7 +655,7 @@ def _set_bool(blk, name, value):
 
 
 def _set_psk(blk, psk):
-    """写入 <string name="PreSharedKey">（psk=None 表示开放网络）"""
+    """write <string name="PreSharedKey"> (psk=None means an open network)"""
     blk = re.sub(r'<string name="PreSharedKey">.*?</string>', "", blk, count=1, flags=re.S)
     blk = re.sub(r'<null name="PreSharedKey" />', "", blk, count=1)
     new = ('<null name="PreSharedKey" />' if psk is None
@@ -428,11 +673,12 @@ def _set_bytearray(blk, name, hexval):
 
 
 def make_block(text, ssid, psk=None, open_net=False):
-    """克隆文件里已有的一个 <Network> 块，再改写关键字段。
+    """Clone an existing <Network> block and rewrite the fields that matter.
 
-    为什么要克隆而不是手写：Android 的解析器对字段很挑，手写的块会被丢掉
-    （实测缺 CreationTime 时框架重启后网络就没了）。克隆能保证格式与系统
-    自己写出来的完全一致。
+    Why clone instead of writing one from scratch: Android's parser is picky and
+    silently drops blocks with missing fields (measured: without CreationTime the
+    network disappears on the next framework restart).  Cloning guarantees the
+    exact format the system writes itself.
     """
     nets = parse_networks(text)
     blk = nets[-1][1] if nets else TEMPLATE
@@ -461,42 +707,39 @@ def make_block(text, ssid, psk=None, open_net=False):
 def insert_block(text, block):
     j = text.find("</NetworkList>")
     if j < 0:
-        die("WifiConfigStore.xml 里没有 </NetworkList>")
-    # 插在 </NetworkList> 前面，缩进对齐
+        die("WifiConfigStore.xml has no </NetworkList>")
     return text[:j] + block + "\n" + text[j:]
 
 
-def cmd_add(ssid, psk=None, open_net=False, do_apply=False):
+def cmd_add(ssid, psk=None, open_net=False, remind=True):
     if not ssid:
-        die("SSID 不能为空")
+        die(t("ssid_empty"))
     if not open_net:
         if not psk:
-            die("需要密码（或用 --open）")
+            die(t("need_psk"))
         if not (8 <= len(psk) <= 63):
-            die("WPA2 密码必须是 8~63 个字符")
+            die(t("psk_len"))
     text = read_text()
     existing = [s for s, _ in parse_networks(text)]
     if ssid in existing:
-        die("这个 SSID 已经保存过了：%s（要改密码先 n2wifi del \"%s\"）" % (ssid, ssid))
+        die(t("already", ssid=ssid))
     b = backup()
     new_text = insert_block(text, make_block(text, ssid, psk, open_net))
     write_atomic(new_text)
     after = parse_networks(read_text())
     if ssid not in [s for s, _ in after] or len(after) != len(existing) + 1:
-        die("写入后校验失败，用 n2wifi revert 恢复（备份：" + b + "）")
-    print("[ok] 已写入：%s（原有 %d 个 -> 现在 %d 个）" % (ssid, len(existing), len(after)))
-    print("     备份：" + b)
-    if do_apply:
-        cmd_apply()
-    else:
-        print("     注意：现在只是写进文件；要让 Android 生效请跑  n2wifi apply")
+        die(t("write_verify_fail", b=b))
+    print(t("added", ssid=ssid, old=len(existing), new=len(after)))
+    print(t("backup_line", b=b))
+    if remind:
+        print(t("add_only_note"))
 
 
 def cmd_del(ssid):
     text = read_text()
     nets = parse_networks(text)
     if not any(s == ssid for s, _ in nets):
-        die("没找到这个 SSID：" + ssid)
+        die(t("no_such_ssid", ssid=ssid))
     b = backup()
     new_text = text
     for s, blk in nets:
@@ -506,14 +749,14 @@ def cmd_del(ssid):
     write_atomic(new_text)
     after = [s for s, _ in parse_networks(read_text())]
     if ssid in after or len(after) != len(nets) - 1:
-        die("删除后校验失败，用 n2wifi revert 恢复（备份：" + b + "）")
-    print("[ok] 已删除：%s（剩 %d 个）" % (ssid, len(after)))
-    print("     备份：" + b)
-    print("     让 Android 生效：n2wifi apply")
+        die(t("del_verify_fail", b=b))
+    print(t("deleted", ssid=ssid, n=len(after)))
+    print(t("backup_line", b=b))
+    print(t("apply_note"))
 
 
 def find_pid(name):
-    """在 /proc 里按 cmdline 找进程"""
+    """find a process by cmdline, without depending on pgrep"""
     for d in glob.glob("/proc/[0-9]*"):
         try:
             with open(d + "/cmdline", "rb") as f:
@@ -529,23 +772,22 @@ def find_pid(name):
 
 
 def cmd_apply():
-    """让 Android 重新加载 WiFi 配置。
+    """Make Android reload the Wi-Fi config.
 
-    做法：杀掉 system_server。zygote 会因为 system server 死掉而退出，
-    init 再把它拉起来 —— 新的 system_server 会重新读 WifiConfigStore.xml。
-    netd / wpa_supplicant 不受影响，所以 WiFi 链路和我们的 ssh 都能活着。
+    Killing system_server makes zygote exit and init start a fresh system_server,
+    which re-reads WifiConfigStore.xml.  netd and wpa_supplicant are untouched,
+    so the link (and our ssh session) normally stays alive.
     """
     pid = find_pid("system_server")
     if not pid:
-        die("没找到 system_server，Android 框架是不是没起来？")
-    print("正在让 Android 重新加载 WiFi 配置（重启 system_server，pid=%d）..." % pid)
-    print("  提示：netd/wpa_supplicant 不停，WiFi 和 ssh 应该不会断；")
-    print("        个别 ROM 会把它当成崩溃而整体重启，那样 1~2 分钟后自动回来。")
+        die(t("apply_no_ss"))
+    print(t("apply_start", pid=pid))
+    print(t("apply_hint1"))
+    print(t("apply_hint2"))
     try:
         os.kill(pid, 9)
     except OSError as e:
-        die("杀 system_server 失败：%s" % e)
-    # 等一个新的 system_server 起来
+        die(t("apply_kill_fail", e=e))
     t0 = time.time()
     newpid = None
     while time.time() - t0 < 180:
@@ -555,10 +797,10 @@ def cmd_apply():
             newpid = p
             break
     if newpid:
-        print("[ok] system_server 已重新起来（pid=%d，用了 %d 秒）" % (newpid, time.time() - t0))
+        print(t("apply_back", pid=newpid, sec=int(time.time() - t0)))
     else:
-        print("[!] 180 秒内没看到新的 system_server（可能整机重启了，等它自己回来）")
-    # 等 WiFi 重新关联（刚重启框架时 STA 会短暂断开）
+        print(t("apply_late"))
+    # wait for the station to reassociate
     t1 = time.time()
     while time.time() - t1 < 90:
         time.sleep(3)
@@ -569,7 +811,11 @@ def cmd_apply():
 
 
 def cmd_backups():
-    for f in sorted(glob.glob(XML + ".n2bak-*")):
+    found = sorted(glob.glob(XML + ".n2bak-*"))
+    if not found:
+        print(t("no_backups"))
+        return
+    for f in found:
         print("%s  (%s)" % (f, time.strftime("%Y-%m-%d %H:%M:%S",
                                              time.localtime(os.path.getmtime(f)))))
 
@@ -578,57 +824,77 @@ def cmd_revert(path=None):
     if not path:
         cands = sorted(glob.glob(XML + ".n2bak-*"))
         if not cands:
-            die("没有备份")
+            die(t("no_backups"))
         path = cands[-1]
     if not os.path.exists(path):
-        die("备份不存在：" + path)
+        die(t("no_such_backup", p=path))
     with open(path, "r", encoding="utf-8") as f:
         chk = f.read()
     if "<NetworkList>" not in chk:
-        die("这个备份看起来不完整，拒绝恢复")
+        die(t("bad_backup"))
     shutil.copy2(path, XML)
     try:
         os.chmod(XML, 0o600)
         os.chown(XML, UID, GID)
     except OSError:
         pass
-    print("[ok] 已从备份恢复：" + path)
-    print("     让 Android 生效：n2wifi apply")
+    print(t("reverted", p=path))
+    print(t("apply_note"))
 
 
-USAGE = __doc__
+def cmd_join(ssid, psk=None, open_net=False):
+    cmd_add(ssid, psk, open_net, remind=False)
+    cmd_apply()
 
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
 
 def main():
-    if os.geteuid() != 0:
-        die("请用 root 运行")
+    global LANG
     a = sys.argv[1:]
+
+    # --lang can appear anywhere
+    if "--lang" in a:
+        i = a.index("--lang")
+        val = a[i + 1] if i + 1 < len(a) else ""
+        if val not in ("en", "zh"):
+            die("--lang expects 'en' or 'zh'")
+        LANG = val
+        del a[i:i + 2]
+
     if not a or a[0] in ("-h", "--help", "help"):
-        print(USAGE)
+        print(usage())
         return
+    if a[0] in ("-V", "--version", "version"):
+        print("n2wifi " + VERSION)
+        return
+
+    if os.geteuid() != 0:
+        die(t("not_root"))
+
     cmd = a[0]
     if cmd == "list":
         cmd_list()
     elif cmd == "status":
         cmd_status()
+    elif cmd == "ip":
+        cmd_ip()
     elif cmd == "scan":
         cmd_scan("--all" in a)
-    elif cmd == "add":
+    elif cmd in ("add", "join"):
         if len(a) < 2:
-            die("用法：n2wifi add <SSID> <密码>   或   n2wifi add <SSID> --open")
+            die(t("usage_add") if cmd == "add" else t("usage_join"))
         open_net = "--open" in a
         psk = None if open_net else (a[2] if len(a) > 2 else None)
-        cmd_add(a[1], psk, open_net, do_apply=False)
-    elif cmd == "join":
-        if len(a) < 2:
-            die("用法：n2wifi join <SSID> <密码>   或   n2wifi join <SSID> --open")
-        open_net = "--open" in a
-        psk = None if open_net else (a[2] if len(a) > 2 else None)
-        cmd_add(a[1], psk, open_net, do_apply=False)
-        cmd_apply()
+        if cmd == "add":
+            cmd_add(a[1], psk, open_net)
+        else:
+            cmd_join(a[1], psk, open_net)
     elif cmd == "del":
         if len(a) < 2:
-            die("用法：n2wifi del <SSID>")
+            die(t("usage_del"))
         cmd_del(a[1])
     elif cmd == "apply":
         cmd_apply()
@@ -637,7 +903,7 @@ def main():
     elif cmd == "revert":
         cmd_revert(a[1] if len(a) > 1 else None)
     else:
-        die("未知命令：" + cmd + "\n" + USAGE)
+        die(t("unknown_cmd", cmd=cmd, usage=usage()))
 
 
 if __name__ == "__main__":
