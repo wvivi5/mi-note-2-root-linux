@@ -10,6 +10,8 @@
 
 # Shell scripts that get run by the kernel / init without a matching extension.
 device/mp_p1  text eol=lf
+# Python tool pushed into the chroot and executed via its shebang.
+device/n2wifi  text eol=lf
 
 # Never touch these.
 *.gz   -text
