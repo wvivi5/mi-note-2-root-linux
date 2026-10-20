@@ -346,10 +346,30 @@ while :; do
     case "$out" in
         *fail*|"") echo "$(date) $out" >> $LOG ;;
         *) if [ "$out" != "$LAST" ]; then
-               echo "$(date) $out" >> $LOG
+               # Read the PMIC back on every slot change.  A line without a
+               # future alrm_time is the proof that a power-off at that moment
+               # would strand the phone -- and unlike "the daemon is running",
+               # it cannot lie.
+               AL=$(sed -n 's/^alrm_time[^:]*: *//p' /proc/driver/rtc 2>/dev/null)
+               IRQ=$(sed -n 's/^alrm_IRQ[^:]*: *//p' /proc/driver/rtc 2>/dev/null)
+               echo "$(date) $out [pmic alrm=${AL:-none} irq=${IRQ:-?}]" >> $LOG
                LAST=$out
            fi ;;
     esac
+    # PMIC watchdog: the register must still hold the slot we just armed.  This
+    # catches the one failure mode the log cannot show otherwise -- an alarm
+    # that gets consumed or cleared BEFORE the phone is powered off.  In that
+    # state the daemon looks perfectly healthy and the next power-off is dead.
+    want=$(printf '%s' "$out" | sed -n 's/^slot \([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\).*/\1/p')
+    if [ -n "$want" ]; then
+        AL=$(sed -n 's/^alrm_time[^:]*: *//p' /proc/driver/rtc 2>/dev/null)
+        if [ "$AL" != "$want" ] && [ "$AL/$want" != "$MISS" ]; then
+            MISS="$AL/$want"
+            echo "$(date) pmic alarm LOST: want=$want got=${AL:-none} (re-armed, but a power-off in this window is fatal)" >> $LOG
+        elif [ "$AL" = "$want" ]; then
+            MISS=
+        fi
+    fi
     sz=$(wc -c < $LOG 2>/dev/null)
     [ -n "$sz" ] && [ "$sz" -gt 65536 ] && { tail -n 200 $LOG > $LOG.tmp; mv -f $LOG.tmp $LOG; }
     sleep 15
