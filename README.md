@@ -43,6 +43,20 @@ ssh 进去的 Linux 小盒子 —— 这就是这个仓库的全部内容。
 
 要跑服务，也可以直接在 chroot 里 apt 装（原生速度）。
 
+### 想远程换 WiFi（不用碰屏幕）？
+
+手机到了新场地要连新路由器时，`n2wifi` 可以**只用 ssh** 把 WiFi 加进去：
+
+```bash
+n2wifi list                                  # 已保存的网络 / 当前连的是哪个
+n2wifi join "SiteA-5G" "password"            # 存进去并让 Android 立刻重新加载
+```
+
+它改的是 Android 8 自己的 WiFi 配置存储（`/data/misc/wifi/WifiConfigStore.xml`），
+所以**重启后依然有效**；而且"加网络"不会把你从当前 WiFi 上踢下来 ——
+新网络只有在信号范围内才会被自动选中，可以提前把现场所有路由器都存进去。
+详见 [`device/README.md` §10](device/README.md)。
+
 ---
 
 ## 快速开始
@@ -83,6 +97,8 @@ device/                       部署与运维脚本（PowerShell + 手机侧 sh�
   *.bat                       双击启动器
   boot_root_payload.sh        设备上的 root 载荷（密码、sshd、看门狗、oom、日志外带）
   udocker-setup.sh            在 Linux 里一键装 udocker（跑 Docker 镜像，见 DOCKER_VERDICT.md）
+  n2wifi                      纯 ssh 管理 Android 侧 WiFi（list/status/join/add/del/apply）
+  push-wifi-tool.ps1          把 n2wifi 推到单台 / 整个网段
   00-startup.sh               开机钩子（内核守卫、Termux:Boot 入口）
   p1.sh / p2.sh / p2wrap.sh   部署期 stage-1 / stage-2 / root 包装
   note2-rootfs.tar.gz         Ubuntu 22.04 模板（Release 附件，含 openssh-server）

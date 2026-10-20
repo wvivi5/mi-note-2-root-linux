@@ -165,6 +165,8 @@ for p in $(pgrep -x sshd); do cat /proc/$p/oom_score_adj; done   # 正常都是 
 | `status-all.ps1` | PC | 机队状态巡检（TCP 探测 8022/8023，`-Deep` 真登录） |
 | `collect-info.ps1` | PC | **上链前的体检**：逐台读 model/build/补丁级别/内核 `uname -r` 与 `/proc/version`，判定内核是否匹配 exploit 地址表（`-Csv` 可导出） |
 | `rerun.ps1` | PC | 改完载荷后**免重启**重新触发一次 root 链（随机不可打印 magic，见 §6） |
+| `push-wifi-tool.ps1` | PC | 把 `n2wifi` 推到手机（单台 / 整个网段，见 §10） |
+| `n2wifi` | **root**（chroot） | 通过 ssh 管理 Android 侧 WiFi：`list/status/join/add/del/apply/backups/revert`（见 §10） |
 | `00-startup.sh` | App | Termux:Boot 钩子：自愈式铺文件 + 起 8023 + **内核守卫** + 跑 root 链 → 8022 |
 | `boot_root_payload.sh` | **root** | root 载荷（部署为 `$HOME/n2/rootcmd.sh`）：解包/挂载 Ubuntu rootfs、设 root 密码、起 8022 sshd、起看门狗、刷新开机钩子、导出日志、**切 USB host 模式并拉起有线网卡守护（§USB 有线网卡）** |
 | `p1.sh` | **root** | 部署期 stage-1：解包 Termux bootstrap、装开机钩子、拉起 p2wrap |
@@ -525,4 +527,77 @@ MIUI 的"一键清理"、`am force-stop`、低内存杀手都可能干掉我们�
   `com.termux_1002.apk` 111MB）—— 这三个走 **Release 附件**
   （https://github.com/wvivi5/mi-note-2-root-linux/releases/tag/v1.0）。
 - **私钥绝不进仓库**（`ssh/note2_key` 被忽略）；克隆后跑 `.\device\make-key.ps1` 生成自己的密钥。
+
+## 10. 通过 ssh 设置 WiFi（不用碰屏幕）
+
+换场地 / 换路由器时，最烦的就是「手机没屏幕、又必须先连上新 WiFi 才能 ssh」。`n2wifi` 解决这件事。
+
+**先说清一件事**：WiFi **不是** chroot 里的 Ubuntu 在管，是 Android（MIUI）的 `wpa_supplicant` 在管。
+所以不能直接 `wpa_cli`（本机实测：控制口对第三方客户端完全不回包），而是改 **Android 8 的 WiFi 配置存储**，再让框架重新加载。
+
+### 10.1 装（一次性，之后可反复覆盖）
+
+```powershell
+.\device\push-wifi-tool.ps1 -IPs 192.168.68.185            # 单台
+.\device\push-wifi-tool.ps1 -Range 192.168.68.180-199      # 整个机队
+```
+
+装了 `/usr/local/bin/n2wifi`（脚本本体在 `device\n2wifi`，是 Python3，chroot 里自带）。
+
+### 10.2 用
+
+```bash
+n2wifi list                          # 已保存的都有哪些，哪个正在连
+n2wifi status                        # 当前 SSID / 信号 / 频段 / IP
+
+n2wifi join  "新SSID" "密码"          # 写入 + 立刻让 Android 重新加载（推荐）
+n2wifi add   "新SSID" "密码"          # 只写入，下次框架/系统重启才生效
+n2wifi add   "免费WiFi" --open        # 开放网络
+n2wifi del   "旧SSID"                 # 删掉某个
+n2wifi apply                          # 手动让它重新加载
+n2wifi backups / n2wifi revert        # 看备份 / 回滚到上一个备份
+```
+
+`join` 是整条最常用的：写配置 → 杀掉 `system_server`（zygote 会自动把它拉起来，约 4~20 秒）→ 新框架重读配置 → 等 WiFi 重新关联 → 打印状态。
+
+### 10.3 关键行为（实测过的）
+
+| 行为 | 说明 |
+|---|---|
+| **不会把你踢下线** | 只是「多存一个网络」，手机仍然待在原来的网络上；新网络只有**在范围内**时才会被自动选中 |
+| **持久** | 写进 `WifiConfigStore.xml`，重启/断电恢复后依然在（框架自己重写这个文件时也会保留它） |
+| **断电也不怕** | 和 §6 的通电自启互不干扰 |
+| **断了还能救** | 万一新网络不通，手机还在旧网络上；真全断了就走 USB（`adb forward tcp:8022 tcp:8022`） |
+| **密码规则** | WPA2 必须 8~63 字符；开放网络用 `--open` |
+
+### 10.4 典型场景
+
+**提前把现场的路由器都存进去**（手机还在你现在这台路由器上）：
+
+```bash
+n2wifi join "SiteA-2.4G" "passwordA"
+n2wifi join "SiteA-5G"   "passwordA"
+```
+
+手机到了现场、扫到这些 SSID 就会自己连过去，全程不用开屏。
+
+**现场只有一根网线 / 一台临时路由器**：先让手机连上临时 WiFi，再 `n2wifi join` 目标网络，最后撤掉临时 WiFi 即可。
+
+### 10.5 怎么找到它换网后的新 IP
+
+`join` 之后如果 SSID 变了、网段也变了，旧 IP 就失效了。找法（按顺序）：
+
+1. 路由器后台的 DHCP 客户端列表（最省事）；
+2. 同一网段下 `.\device\status-all.ps1 -Range <新网段>` 扫一遍 8022；
+3. USB 兜底：`adb forward tcp:8022 tcp:8022` → `ssh -p 8022 root@127.0.0.1` → `n2wifi status`。
+
+### 10.6 实现细节 / 坑（留给以后改的人）
+
+- 配置在 `/data/misc/wifi/WifiConfigStore.xml`（`root:root` 可读写，属主必须是 `1000:1000`、权限 `600`）。
+- **必须克隆文件里已有的一个 `<Network>` 块再改字段**，不能手写。手写的块（哪怕只少 `<string name="CreationTime">`）会被 Android 解析器丢掉：框架重启后文件被写回原样，网络消失。克隆法实测被完整保留。
+- `n2wifi apply` = `kill -9 system_server`（不是 `stop; start`）：这样 `netd` / `wpa_supplicant` 不停，WiFi 链路和 ssh 都能活下来。但**有的 ROM 会把它当成崩溃而整机重启**（本机实测出现过一次，约 90 秒自动回来，配置照样生效）—— 所以 `join` 之后如果 ssh 断了，等 1~2 分钟再连。
+- 每次写入前自动备份到 `WifiConfigStore.xml.n2bak-<时间戳>`；写入是「临时文件 + 校验 XML + `rename`」，校验不过绝不覆盖原文件。
+- 该机型的 `wpa_supplicant` 控制口（`/data/misc/wifi/sockets/wlan0`、`/dev/socket/wpa_wlan0`）**收包但从不回包**（`wpa_cli`、裸 socket 全超时，权限已排除），所以不要指望 `wpa_cli` 那条路。
+- 本机 Android 8 没有 `cmd wifi`（`cmd -l` 无 wifi 服务），也没有 `wpa_cli`、没有 `WifiManager` shell 接口 —— 改配置存储是唯一不碰屏幕的路。
+
 

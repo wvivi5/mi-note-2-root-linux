@@ -83,6 +83,7 @@ Ok 'scripts (.ps1 / .sh)'
 $assets = @(
     'device\p1.sh', 'device\p2.sh', 'device\p2wrap.sh', 'device\mp_p1',
     'device\00-startup.sh', 'device\authorized_keys', 'device\boot_root_payload.sh',
+    'device\n2wifi',
     'device\n2\e2', 'device\n2\trigger', 'device\n2\mp',
     'device\note2-rootfs.tar.gz', 'device\termux-bootstrap.tar'
 )
