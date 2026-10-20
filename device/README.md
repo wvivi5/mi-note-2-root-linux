@@ -346,6 +346,23 @@ MIUI 的"一键清理"、`am force-stop`、低内存杀手都可能干掉我们�
 > 8023 需要联网装 openssh（`p2.sh` 里装）；新装 bootstrap 缺 apt 缓存目录这个坑已修，
 > 实测有 WiFi 的机器 8023 可用（`u0_a144@<ip>:8023`，密钥登录）。
 
+#### 载荷为什么必须能"重复跑"（重要）
+
+Android 在**每次 `system_server` 重启**时都会重新发一遍 `BOOT_COMPLETED`，Termux:Boot 于是把
+`00-startup.sh` → root 链 → 本载荷**再跑一遍**。`system_server` 重启并不罕见：MIUI 自己会崩，
+而 `n2wifi apply`（见 §10）就是**故意**杀掉它来让 WiFi 配置生效。
+
+所以载荷做了三件事，让"跑 N 次"和"跑 1 次"结果一样：
+
+1. **单实例锁**：`mkdir /data/local/tmp/n2-payload.lock`（原子操作，120 秒后视为残留锁可接管）。
+   并发的第二次运行直接跳过，日志里留 `payload skipped: another run holds the lock`。
+2. **看门狗先杀干净再起**：杀掉后轮询 `/proc/*/comm` 直到真的为 0（最多 5 秒），避免新旧交替时多起。
+3. **看门狗自限**：`n2watch` 启动 10 秒后数兄弟，如果已有 2 个**更老的**（pid 更小）就自己退出；
+   只有"少于 2 个"时才补位。这样即使锁被绕过，最终也只会有 2 个。
+
+> 实测（2026-10-20，4bbc97a9）：修之前一次重启 + 两次框架重启累积出 **8 个 n2watch**；
+> 修之后并发跑两次载荷 → 2 个，再顺序跑一次 → 仍是 2 个，USB 守护/RTC 守护也都各 1 个。
+
 ### 通电自启（PMIC RTC 闹钟）—— 现场停电靠它
 
 锁 BL 的 LK 无视 `fastboot oem off-mode-charge`：插电时如果手机是关机的，只会停在**充电模式**
@@ -479,6 +496,7 @@ MIUI 的"一键清理"、`am force-stop`、低内存杀手都可能干掉我们�
 | 冷启动后 8022 不亮，也看不出钩子跑没跑 | `adb logcat -s n2boot` —— 钩子会把关键行镜像到 logcat（`N2 ...`），能直接看到走到哪一步、守卫是否放行 |
 | 8022 起不来，`/data/local/tmp/boot.log` 里有 `kernel guard` 字样 | 这台机器的内核/ROM 与 exploit 地址表不匹配，守卫**故意**跳过了 root 链（避免无限重启）。先 `collect-info.ps1` 确认，再决定是否重算偏移或 `-ForceKernel` |
 | 改了载荷但不想重启 | `.\device\rerun.ps1 -Serial <SN>` |
+| `pgrep -x n2watch \| wc -l` 不是 2（4/6/8 个） | 2026-10-20 之前的载荷在「框架重启 → BOOT_COMPLETED 重发 → 开机链重跑」时会叠加。已修（单实例锁 + 计数起 + 看门狗自限，见 §6）；跑一次 `rerun.ps1` 让新载荷把这些多余的收掉 |
 | **想在 Linux 里跑 Docker** | **原生 Docker 不行，但 udocker 可以**。`docker.io` 能 apt 装上，但 `dockerd` 启动即 SIGSEGV；手工 `runc` 也死在 `mountpoint for devices not found`（内核没有 `devices` cgroup 控制器，也没有 UTS / IPC / user namespace、overlayfs、NAT 模块）。**替代 = `udocker`**（PRoot 用户态 chroot，不需要那些内核特性）：跑 `sh ./udocker-setup.sh` 一键装好，实测能拉能跑（hello-world / alpine / busybox，`--publish` 端口映射有效）。注意没有隔离，只跑可信镜像。完整证据见 [`../DOCKER_VERDICT.md`](../DOCKER_VERDICT.md) |
 | 忘了密码 / 想关掉密码登录 | ssh 用密钥进去后 `passwd root` 改密码（不会被开机覆盖，因为有 `/root/.n2-pw-set`）；要彻底禁用就 `passwd -l root` |
 | ssh 报 `Permission denied (publickey)` 但密码是对的 | 检查服务器是否真开了密码登录：`ps -ef \| grep 'sshd -p 8022'` 应看到 `PasswordAuthentication=yes`；看门狗拉起来的 sshd 也带这些参数 |

@@ -31,6 +31,32 @@ R=$H/linux/rootfs
 
 echo "=== root payload start $(date) uid=$(id -u) ===" >> $LOG
 
+# --- 0a. Single instance -----------------------------------------------------
+# Termux:Boot fires on EVERY BOOT_COMPLETED broadcast, and Android re-sends that
+# on every system_server restart -- MIUI does it by itself, and `n2wifi apply`
+# does it on purpose (that is how the WiFi config is reloaded).  So this payload
+# *will* run several times per power-on, sometimes concurrently.  Without a lock
+# each overlapping run kills + restarts the watchdogs and leaves 4/6/8 of them
+# behind (observed: 8 after one reboot + two framework restarts).
+# mkdir is atomic, so this is a race-free "one payload at a time" lock.
+LOCKDIR=/data/local/tmp/n2-payload.lock
+if mkdir "$LOCKDIR" 2>/dev/null; then
+    date +%s > "$LOCKDIR/ts" 2>/dev/null
+    trap 'rm -rf "$LOCKDIR"' EXIT
+else
+    LOCKT0=$(tr -dc 0-9 < "$LOCKDIR/ts" 2>/dev/null)
+    NOW=$(date +%s)
+    if [ -n "$LOCKT0" ] && [ $((NOW - LOCKT0)) -lt 120 ]; then
+        echo "=== payload skipped: another run holds the lock (age $((NOW - LOCKT0))s) ===" >> $LOG
+        exit 0
+    fi
+    # stale lock: a previous run was SIGKILLed before its trap could clean up
+    echo "=== taking over a stale payload lock ===" >> $LOG
+    rm -rf "$LOCKDIR"
+    mkdir "$LOCKDIR" 2>/dev/null && date +%s > "$LOCKDIR/ts" 2>/dev/null
+    trap 'rm -rf "$LOCKDIR"' EXIT
+fi
+
 # --- 0. Keep the app-side boot hook in sync with the staging area ------------
 # The hook has to live inside the app's data dir (that is where Termux:Boot
 # looks), and the adb shell user cannot write there.  Only root can, and root is
@@ -361,6 +387,21 @@ echo -1000 > /proc/self/oom_score_adj 2>/dev/null
 # the "am I alone?" check below sees a stable count instead of a 1 -> spawn race.
 sleep 10
 LOG=/var/log/n2watch.log
+# Keep exactly TWO.  The payload may legitimately run several times per power-on
+# (Android re-sends BOOT_COMPLETED on every system_server restart), and the
+# sibling-spawn logic below only ever *adds* when fewer than two are alive -- so
+# surplus copies have to remove themselves.  The two oldest (lowest pids) win.
+me=$$
+older=0
+for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    [ "$(cat $d/comm 2>/dev/null)" = n2watch ] || continue
+    [ "$pid" -lt "$me" ] && older=$((older + 1))
+done
+if [ "$older" -ge 2 ]; then
+    echo "$(date) surplus watchdog $me ($older older) -> exiting" >> $LOG
+    exit 0
+fi
 while :; do
     # Only the LISTEN state counts: a stale TIME_WAIT pair also contains
     # ":1F56" and would mask a dead sshd.
@@ -408,7 +449,18 @@ for d in /proc/[0-9]*; do
         n2watch|n2watch.sh) kill -9 ${d#/proc/} 2>/dev/null ;;
     esac
 done
-sleep 1
+# Wait until they are really gone: a watchdog forks a sibling every 60 s, so one
+# can pop up between the scan above and the start below.
+i=0
+while [ $i -lt 5 ]; do
+    n=0
+    for d in /proc/[0-9]*; do
+        [ "$(cat $d/comm 2>/dev/null)" = n2watch ] && n=$((n + 1))
+    done
+    [ "$n" -eq 0 ] && break
+    sleep 1
+    i=$((i + 1))
+done
 # two watchdogs from the start: redundancy should not depend on the watchdog
 # being able to count its own siblings.
 for i in 1 2; do
