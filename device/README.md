@@ -166,7 +166,7 @@ for p in $(pgrep -x sshd); do cat /proc/$p/oom_score_adj; done   # 正常都是 
 | `collect-info.ps1` | PC | **上链前的体检**：逐台读 model/build/补丁级别/内核 `uname -r` 与 `/proc/version`，判定内核是否匹配 exploit 地址表（`-Csv` 可导出） |
 | `rerun.ps1` | PC | 改完载荷后**免重启**重新触发一次 root 链（随机不可打印 magic，见 §6） |
 | `push-wifi-tool.ps1` | PC | 把 `n2wifi` 推到手机（单台 / 整个网段，见 §10） |
-| `n2wifi` | **root**（chroot） | 通过 ssh 管理 Android 侧 WiFi：`list/status/join/add/del/apply/backups/revert`（见 §10） |
+| `n2wifi` | **root**（chroot） | 通过 ssh 管理 Android 侧 WiFi：`list/status/scan/join/add/del/apply/backups/revert`（见 §10） |
 | `00-startup.sh` | App | Termux:Boot 钩子：自愈式铺文件 + 起 8023 + **内核守卫** + 跑 root 链 → 8022 |
 | `boot_root_payload.sh` | **root** | root 载荷（部署为 `$HOME/n2/rootcmd.sh`）：解包/挂载 Ubuntu rootfs、设 root 密码、起 8022 sshd、起看门狗、刷新开机钩子、导出日志、**切 USB host 模式并拉起有线网卡守护（§USB 有线网卡）** |
 | `p1.sh` | **root** | 部署期 stage-1：解包 Termux bootstrap、装开机钩子、拉起 p2wrap |
@@ -643,6 +643,8 @@ Android 在**每次 `system_server` 重启**时都会重新发一遍 `BOOT_COMPL
 ```bash
 n2wifi list                          # 已保存的都有哪些，哪个正在连
 n2wifi status                        # 当前 SSID / 信号 / 频段 / IP
+n2wifi scan                          # 扫周边 WiFi：信号 / 频段 / 信道 / 加密（同名取最强）
+n2wifi scan --all                    # 同上，但按 BSSID 全列（看有几个 AP / 漫游点）
 
 n2wifi join  "新SSID" "密码"          # 写入 + 立刻让 Android 重新加载（推荐）
 n2wifi add   "新SSID" "密码"          # 只写入，下次框架/系统重启才生效
@@ -651,6 +653,12 @@ n2wifi del   "旧SSID"                 # 删掉某个
 n2wifi apply                          # 手动让它重新加载
 n2wifi backups / n2wifi revert        # 看备份 / 回滚到上一个备份
 ```
+
+`scan` 是直接调 chroot 里的 `iw dev wlan0 scan`，不走 wpa_supplicant 的控制口，所以在没屏幕的情况下也能看清现场有哪些 SSID、2.4G 还是 5G、信号多少 dBm、加密方式是什么（`开放` / `WEP` / `WPA` / `WPA/WPA2` / `WPA2/WPA3`），并用 `[当前]` / `[已保存]` 标出来，省得 `join` 时把名字打错。
+
+如果 `scan` 报 `扫描失败` 或 `找不到 iw`：
+- `wlan0` 没起来（飞行模式 / WiFi 关了）→ 先 `svc wifi enable`，等 10 秒再扫
+- chroot 里没装 `iw` → `apt-get install -y iw`（工具会自动退化到用 Android 的 `/system/bin/iw`，一般不需要装）
 
 `join` 是整条最常用的：写配置 → 杀掉 `system_server`（zygote 会自动把它拉起来，约 4~20 秒）→ 新框架重读配置 → 等 WiFi 重新关联 → 打印状态。
 
@@ -674,6 +682,8 @@ n2wifi join "SiteA-5G"   "passwordA"
 ```
 
 手机到了现场、扫到这些 SSID 就会自己连过去，全程不用开屏。
+
+不确定 SSID 拼写就先用 `n2wifi scan` 看一眼：大小写、`_5G` 后缀、末尾空格都算不同的名字，写错了永远不会自动连。
 
 **现场只有一根网线 / 一台临时路由器**：先让手机连上临时 WiFi，再 `n2wifi join` 目标网络，最后撤掉临时 WiFi 即可。
 

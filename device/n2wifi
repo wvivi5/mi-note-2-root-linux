@@ -15,6 +15,8 @@ n2wifi —— 通过 ssh（在 Ubuntu chroot 里）管理 Android 侧的 WiFi �
 用法：
   n2wifi list                     列出已保存的 SSID
   n2wifi status                   当前连接状态
+  n2wifi scan                     扫描周边 WiFi（信号/频段/信道/加密）
+  n2wifi scan --all               同上，但列出每个 BSSID（不过滤同名）
   n2wifi join  <SSID> <密码>      写入并让框架重新加载（默认，推荐）
   n2wifi add   <SSID> <密码>      只写入，不重启框架（下次重启生效）
   n2wifi add   <SSID> --open      写一个开放网络
@@ -35,6 +37,7 @@ import sys
 import glob
 import time
 import shutil
+import unicodedata
 import subprocess
 
 ANDROID_ROOT = "/proc/1/root"
@@ -172,6 +175,157 @@ def current_connection():
     except Exception:
         pass
     return info
+
+
+def dw(s):
+    """终端显示宽度：中文/全角算 2"""
+    w = 0
+    for ch in str(s):
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def pad(s, width):
+    s = str(s)
+    return s + " " * max(0, width - dw(s))
+
+
+def chan_of(freq):
+    try:
+        f = int(freq)
+    except Exception:
+        return "?"
+    if f == 2484:
+        return "14"
+    if 2412 <= f <= 2472:
+        return str((f - 2407) // 5)
+    if 5000 < f < 5925:
+        return str((f - 5000) // 5)
+    return "?"
+
+
+def band_of(freq):
+    try:
+        f = int(freq)
+    except Exception:
+        return "?"
+    if 2400 <= f < 2500:
+        return "2.4G"
+    if 4900 < f < 5925:
+        return "5G"
+    return str(f) + "M"
+
+
+def security_of(b):
+    if b["rsn"] and b["wpa"]:
+        return "WPA/WPA2"
+    if b["rsn"]:
+        return "WPA2/WPA3"
+    if b["wpa"]:
+        return "WPA"
+    if b["privacy"]:
+        return "WEP"
+    return "开放"
+
+
+def iw_scan():
+    """跑一次 iw scan，返回原始文本。优先用 chroot 自带的 iw。"""
+    if shutil.which("iw"):
+        cmd = ["iw", "dev", "wlan0", "scan"]
+    elif os.path.exists(ANDROID_ROOT + "/system/bin/iw"):
+        cmd = ["chroot", ANDROID_ROOT, "/system/bin/iw", "dev", "wlan0", "scan"]
+    else:
+        die("找不到 iw（chroot 里执行：apt-get install -y iw）")
+    err = ""
+    for i in range(3):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        except subprocess.TimeoutExpired:
+            err = "扫描超时（wlan0 没起来？）"
+            break
+        if p.returncode == 0 and "BSS " in p.stdout:
+            return p.stdout
+        err = (p.stderr or p.stdout).strip() or ("exit %d" % p.returncode)
+        if "busy" not in err.lower():
+            break
+        time.sleep(2)
+    die("扫描失败：" + err)
+
+
+def parse_scan(text):
+    out = []
+    cur = None
+    for line in text.splitlines():
+        if line.startswith("BSS "):
+            if cur:
+                out.append(cur)
+            m = re.match(r"BSS ([0-9a-fA-F:]{17})", line)
+            cur = {"bssid": m.group(1) if m else "?", "freq": "", "signal": None,
+                   "ssid": "", "privacy": False, "rsn": False, "wpa": False,
+                   "associated": "associated" in line}
+            continue
+        if cur is None:
+            continue
+        s = line.strip()
+        if s.startswith("freq:"):
+            cur["freq"] = s.split(":", 1)[1].strip()
+        elif s.startswith("signal:"):
+            m = re.search(r"(-?\d+(?:\.\d+)?)", s)
+            if m:
+                cur["signal"] = float(m.group(1))
+        elif s.startswith("SSID:"):
+            cur["ssid"] = s.split(":", 1)[1].strip()
+        elif s.startswith("capability:"):
+            cur["privacy"] = "Privacy" in s
+        elif s.startswith("RSN:"):
+            cur["rsn"] = True
+        elif s.startswith("WPA:"):
+            cur["wpa"] = True
+    if cur:
+        out.append(cur)
+    return out
+
+
+def cmd_scan(show_all=False):
+    aps = parse_scan(iw_scan())
+    if not aps:
+        print("（没扫到任何 AP）")
+        return
+    cur = current_connection().get("ssid")
+    saved = set(s for s, _ in parse_networks(read_text()))
+    if show_all:
+        rows = sorted(aps, key=lambda b: (b["signal"] is None, -(b["signal"] or -200)))
+    else:
+        best = {}
+        for b in aps:
+            k = b["ssid"] or "<隐藏>"
+            if k not in best or (b["signal"] or -200) > (best[k]["signal"] or -200):
+                best[k] = b
+        rows = sorted(best.values(), key=lambda b: -(b["signal"] or -200))
+    print("扫到 %d 个 AP（%d 个不同 SSID）：" % (len(aps), len(rows)))
+    hdr = pad("信号", 10) + pad("频段", 6) + pad("信道", 6) + pad("加密", 12)
+    if show_all:
+        hdr += pad("BSSID", 19)
+    print("  " + hdr + "SSID")
+    for b in rows:
+        name = b["ssid"] or "<隐藏>"
+        sig = ("%d dBm" % round(b["signal"])) if b["signal"] is not None else "-"
+        tags = []
+        if name == cur:
+            tags.append("当前")
+        elif name in saved:
+            tags.append("已保存")
+        if b["associated"]:
+            tags.append("associated")
+        tail = ("   [" + ",".join(tags) + "]") if tags else ""
+        line = ("  " + pad(sig, 10) + pad(band_of(b["freq"]), 6)
+                + pad(chan_of(b["freq"]), 6) + pad(security_of(b), 12))
+        if show_all:
+            line += pad(b["bssid"], 19)
+        print(line + name + tail)
+    if not show_all:
+        print("")
+        print("加网络：n2wifi add \"<SSID>\" \"<密码>\"     立即用：n2wifi join \"<SSID>\" \"<密码>\"")
 
 
 def cmd_list():
@@ -457,6 +611,8 @@ def main():
         cmd_list()
     elif cmd == "status":
         cmd_status()
+    elif cmd == "scan":
+        cmd_scan("--all" in a)
     elif cmd == "add":
         if len(a) < 2:
             die("用法：n2wifi add <SSID> <密码>   或   n2wifi add <SSID> --open")
