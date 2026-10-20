@@ -51,8 +51,9 @@ Notes:
                   /data/misc/apexdata/com.android.wifi/...      (Android 11+)
     both are checked automatically; set N2WIFI_XML to override
   * every write is backed up first to WifiConfigStore.xml.n2bak-<timestamp>
-  * `apply` restarts system_server; netd and wpa_supplicant keep running, so
-    Wi-Fi and ssh usually survive -- a few ROMs reboot instead (back in 1-2 min)
+  * `apply` restarts system_server; the Wi-Fi link blips for ~30-60 s and an ssh
+    session drops with it (over USB, adb disappears too -- re-plug). The phone
+    itself does not reboot on the test device; a few ROMs may reboot instead
   * docs: README.md / README.zh-CN.md""",
 
     "not_root": "must run as root (uid 0)",
@@ -87,8 +88,8 @@ Notes:
     "not_connected": "(not connected)",
     "apply_no_ss": "system_server not found -- is the Android framework running?",
     "apply_start": "reloading Android Wi-Fi config (restarting system_server, pid={pid}) ...",
-    "apply_hint1": "  note: netd / wpa_supplicant keep running, so Wi-Fi and ssh should stay up;",
-    "apply_hint2": "        a few ROMs treat this as a crash and reboot -- it comes back in 1-2 min.",
+    "apply_hint1": "  note: the framework restart blips wlan0 -- an ssh session over Wi-Fi usually",
+    "apply_hint2": "        drops for 30-60 s and reconnects; over USB, adb disappears too (re-plug).",
     "apply_kill_fail": "cannot kill system_server: {e}",
     "apply_back": "[ok] system_server is back (pid={pid}, {sec}s)",
     "apply_late": "[!] no new system_server within 180 s (the phone may have rebooted; it will come back)",
@@ -144,8 +145,8 @@ M["zh"] = {
               /data/misc/apexdata/com.android.wifi/...     （Android 11+）
     两个路径会自动找；也可以用环境变量 N2WIFI_XML 指定
   * 每次写入前自动备份成 WifiConfigStore.xml.n2bak-<时间戳>
-  * apply 会重启 system_server；netd 和 wpa_supplicant 不停，所以 WiFi 和 ssh
-    通常不会断 —— 个别 ROM 会当成崩溃整机重启（1~2 分钟自己回来）
+  * apply 会重启 system_server；WiFi 链路会抖 30~60 秒，ssh 也跟着断（走 USB 时
+    adb 也会消失，重新插拔即可）。实测机上手机本体不会重启，个别 ROM 可能会
   * 文档：README.md / README.zh-CN.md""",
 
     "not_root": "请用 root 运行（uid 0）",
@@ -180,8 +181,8 @@ M["zh"] = {
     "not_connected": "（未连接）",
     "apply_no_ss": "没找到 system_server，Android 框架是不是没起来？",
     "apply_start": "正在让 Android 重新加载 WiFi 配置（重启 system_server，pid={pid}）...",
-    "apply_hint1": "  提示：netd / wpa_supplicant 不停，WiFi 和 ssh 应该不会断；",
-    "apply_hint2": "        个别 ROM 会把它当成崩溃而整机重启，那样 1~2 分钟后自动回来。",
+    "apply_hint1": "  提示：框架重启时 wlan0 会抖一下，走 WiFi 的 ssh 一般会断 30~60 秒再自己连回来；",
+    "apply_hint2": "        走 USB 时 adb 也会消失（USB gadget 归 system_server 管），重新插拔即可。",
     "apply_kill_fail": "杀 system_server 失败：{e}",
     "apply_back": "[ok] system_server 已重新起来（pid={pid}，用了 {sec} 秒）",
     "apply_late": "[!] 180 秒内没看到新的 system_server（可能整机重启了，等它自己回来）",
