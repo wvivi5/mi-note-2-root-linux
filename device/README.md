@@ -638,6 +638,10 @@ Android 在**每次 `system_server` 重启**时都会重新发一遍 `BOOT_COMPL
 
 装了 `/usr/local/bin/n2wifi`（脚本本体在 `device\n2wifi`，是 Python3，chroot 里自带）。
 
+> `n2wifi` 已单独开源：<https://github.com/wvivi5/n2wifi>（中英文 README、安装脚本、release）。
+> 两处是**同一份代码**；改完记得同步回 `device\n2wifi`，否则下次 `push-wifi-tool.ps1` 会把旧版推回手机。
+> 手机上默认输出英文（`LANG` 为空时），想默认中文：`echo 'export N2WIFI_LANG=zh' >> ~/.bashrc`，或每次加 `--lang zh`。
+
 ### 10.2 用
 
 ```bash
