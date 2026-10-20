@@ -299,7 +299,7 @@ Termux:Boot 开机广播（App 身份 u0_a143）
              └─ 内核 request_module() → modprobe_path → $HOME/n2/rootcmd.sh（uid 0）
                   ├─ 首次解包 Ubuntu rootfs（模板，离线）
                   ├─ 挂载 /proc /sys + 私有 tmpfs /dev
-                   ├─ 【RTC 闹钟】武装 PMIC 唤醒闹钟到下一个 :00/:30（每 30 分钟轮询，见下）
+                   ├─ 【RTC 闹钟】武装 PMIC 唤醒闹钟到下一个 slot（默认每 5 分钟，见下）
                   ├─ 刷新 $HOME/.termux/boot/00-startup.sh（把载荷/钩子的新版本自我同步进去）
                   ├─ 设 root 密码 147147（幂等，见下）+ 起 sshd（`PermitRootLogin=yes` `PasswordAuthentication=yes`）
                   ├─ 起 2 个看门狗（`/root/n2watch`）并把所有 sshd/看门狗 oom_score_adj 压到 -1000
@@ -370,32 +370,68 @@ Android 在**每次 `system_server` 重启**时都会重新发一遍 `BOOT_COMPL
 *已关机* 的手机开机回来** —— 已端到端实测：`reboot -p` 关机后，闹钟到点手机自己开机。
 
 载荷在 chroot 里跑一个常驻守护 `n2rtcalarm`，把 `/dev/rtc0` 的唤醒闹钟（`RTC_WKALM_SET`）
-**每 30 分钟**武装一次：
+**每 5 分钟**重装一次（默认 `step=300` 秒，`:00 :05 :10 …` 就是 slot）：
 
 - **只看时分秒，不看日期。** 这机器的 RTC 停在 `1970-01-02`，`RTC_SET_TIME` 还被 QSEE
-  拒绝（改不了），但都无所谓：每次都是"读 RTC 现在的时分秒 → 算到下一个 `:00`/`:30`
+  拒绝（改不了），但都无所谓：每次都是"读 RTC 现在的时分秒 → 算到下一个 slot
   还差几秒 → 加在 **RTC 自己的时钟** 上"。RTC 复不复位、停在 1970 还是 2026，闹钟永远
-  在最多 30 分钟内到点。
-- **30 分钟是"轮询间隔"**：关机时最多 30 分钟被叫醒一次；开机状态下每到 `:00`/`:30`
-  也会重新武装（守护每 15 秒重算一次）。
+  在最多 `step` 秒内到点。
+- **`step` 是"轮询间隔"**：关机时最多 5 分钟被叫醒一次；开机状态下每个 slot 到来前
+  也会重新武装（守护每 15 秒重算一次，只在 slot 变化时写日志）。
 - **不会误触发**：离下一个 slot 只剩 <45 秒时直接跳到再下一个 slot，所以**开机状态下闹钟
   从不会真的"响"**（同时也就永远留着一个已武装的闹钟，不会出现"空窗"）。
-- **"时刻"不是墙上时间**：RTC 的 22:xx 对不上真实时间，所以 `:00`/`:30` 落在真实的哪一分钟
-  是随机的 —— 反正要的是"最多 30 分钟回来一次"，不是"每天几点"。
+- **"时刻"不是墙上时间**：RTC 的 22:xx 对不上真实时间，所以 slot 落在真实的哪一分钟
+  是随机的 —— 反正要的是"最多 5 分钟回来一次"，不是"每天几点"。
 
-配置（可选）：`echo 1800 > /data/local/tmp/n2-rtc-step`（秒；1800=30 分，900=15 分，
-3600=1 小时）。改完重启一次生效，或 `kill $(cat /run/n2rtcalarm.pid)` 等下次开机重铺。
+**为什么"第一次能自启、第二次以后就不启动"（2026-10-20 定位并修好）**
+
+闹钟是**一次性**的：到点被 PMIC 交付唤醒后，使能位就被硬件清掉。所以"关机后还能自启"的
+唯一前提是：**关机那一刻，确实有一个未来时刻的闹钟武装着**。两条曾经存在的漏洞都会让这个
+前提悄悄消失：
+
+1. **守护被 MIUI 回收。** `n2rtcalarm` 原来 `oom_score_adj=0`，LMK / 清理随手就能杀掉它
+   （实测 pid 5018 在 00:14 还在写日志，00:20 就没了）。它一死，最后一个 slot 到点时手机
+   还开着 → 闹钟被**消耗** → 从此零唤醒源，下一次关机就再也起不来。
+2. **跨重启的 pidfile 误判。** 状态文件 `/run/n2rtcalarm.pid` 在 rootfs 里（`/run` 是普通
+   目录，没有 tmpfs，也没有 init 清理），重启后文件还在，而里面的 pid 已经属于别的进程
+   → `kill -0` 成立 → 载荷以为"守护已在跑"，**直接跳过武装**。开机时消耗掉的那次闹钟没
+   人补，同样导致关机后零唤醒源。
+
+对应三道保险（都已落地）：
+
+- 守护启动就把自己设成 `oom_score_adj=-1000`（和 sshd/看门狗同级，LMK 不会挑它）；
+- 看门狗 `n2watch` 每 15 秒顺带检查守护，死了立刻重拉（实测 20 秒内复活并重新武装）；
+- 状态文件改成 `<boot_id> <pid>`：**同一次开机 + pid 活着**才算"我们的守护"，跨重启不会误判。
+
+每次武装后，载荷会**回读 PMIC 寄存器**并在 `boot.log` 里写一行
+`--- rtc alarm armed (step=300s phase=0s alrm_time=00:35:00) ---`。
+`alrm_time=?` 就意味着当前**没有**唤醒源、关机必死 —— 这是硬件读数，不是"应该没问题"。
+
+配置：
+
+- `echo 300 > /data/local/tmp/n2-rtc-step` —— slot 大小（秒）。300=5 分（默认）、600=10 分、
+  1800=30 分；小于 300 会被夹到 300。
+- `echo 30 > /data/local/tmp/n2-rtc-phase` —— 相位（0…step-1）。10 台机器配 0/30/60/…
+  就能错开，不会同一秒一起开机。
+
+改完重启一次生效；不想重启就 `kill $(cut -d' ' -f2 /run/n2rtcalarm.pid)`，看门狗会在 20 秒内
+用新参数重拉（`/data/local/tmp` 里的两个文件只有载荷读得到，chroot 内看不到）。
 
 排查：
 
 | 看什么 | 命令 |
 |---|---|
-| 守护在不在 | `ps -ef \| grep n2rtcalarm`、`cat /run/n2rtcalarm.pid` |
-| 武装到几点 | `cat /proc/driver/rtc`（看 `alrm_time` / `alarm_IRQ`） |
-| 历史 | `tail /var/log/n2rtc.log`（`slot HH:MM:SS (step Ns)`；失败会打 `WKALM_SET fail:`） |
+| 守护在不在 | `pgrep -ax n2rtcalarm`；`cat /run/n2rtcalarm.pid`（`<boot_id> <pid>`） |
+| **有没有真的武装** | `grep alrm_time /proc/driver/rtc`（空/`alrm_time` 缺 = 没有唤醒源） |
+| 这次开机武装成什么样 | `grep "rtc alarm" /data/local/tmp/boot.log \| tail -3` |
+| 守护死过没有 | `tail /var/log/n2rtc.log`：`slot` 行每 5 分钟一条，**断档就是死过**；重拉会打 `daemon gone -> restarting` |
+| 会不会被回收 | `cat /proc/$(cut -d' ' -f2 /run/n2rtcalarm.pid)/oom_score_adj`（应为 `-1000`） |
 
-> 注意：**完全断电**（拔电池 / 电池彻底耗尽）若让 PMIC 也掉电，RTC 会复位、闹钟随之丢失，
-> 那种情况只能等来电后按一次电源键。日常"电网停电"（手机电池还在）不受影响。
+> 注意：**完全断电**（拔电池 / 电池彻底耗尽且没插线）会连 PMIC 一起掉电 → RTC 归零
+> （`since_epoch` 变小、日期回到 1970）→ **闹钟寄存器一起清空**，只能等来电后按电源键。
+> 判断依据：`since_epoch` 跨关机仍然连续 = PMIC 没掉电、闹钟还在；归零 = 闹钟肯定没了。
+> 所以：**拆过电池/彻底断过电的机器，开机后必须让 root 链跑一次重新武装**（正常情况下
+> Termux:Boot 会自动做）；**无电池的机器不要用来验证"停电自启"** —— 它每次掉电都会丢闹钟。
 
 ### trigger 的两条硬规则（血泪）
 
@@ -497,6 +533,9 @@ Android 在**每次 `system_server` 重启**时都会重新发一遍 `BOOT_COMPL
 | 8022 起不来，`/data/local/tmp/boot.log` 里有 `kernel guard` 字样 | 这台机器的内核/ROM 与 exploit 地址表不匹配，守卫**故意**跳过了 root 链（避免无限重启）。先 `collect-info.ps1` 确认，再决定是否重算偏移或 `-ForceKernel` |
 | 改了载荷但不想重启 | `.\device\rerun.ps1 -Serial <SN>` |
 | `pgrep -x n2watch \| wc -l` 不是 2（4/6/8 个） | 2026-10-20 之前的载荷在「框架重启 → BOOT_COMPLETED 重发 → 开机链重跑」时会叠加。已修（单实例锁 + 计数起 + 看门狗自限，见 §6）；跑一次 `rerun.ps1` 让新载荷把这些多余的收掉 |
+| **关机后不自己开机**（第一次行、第二次以后不行） | 先看 `grep "rtc alarm" /data/local/tmp/boot.log \| tail -3`：出现 `alrm_time=?` 就说明**关机那一刻没有唤醒源**。两个根因已修（守护被 LMK 回收、跨重启 pidfile 误判，见 §6），`rerun.ps1` 升级后重启一次生效 |
+| 想知道这台机器的闹钟到底在不在 | `grep alrm_time /proc/driver/rtc`（有值=武装着，空=没有）；再看 `cat /sys/class/rtc/rtc0/since_epoch`：跨关机连续=PMIC 没掉电，归零=掉过电、闹钟已被清空 |
+| 拆过电池 / 彻底断过电后不自启 | RTC 连闹钟寄存器一起被清空，属**物理限制**，软件无法补救。按一次电源键开机，让 Termux:Boot 重新武装即可。**无电池的机器不要用来验证"停电自启"** |
 | **想在 Linux 里跑 Docker** | **原生 Docker 不行，但 udocker 可以**。`docker.io` 能 apt 装上，但 `dockerd` 启动即 SIGSEGV；手工 `runc` 也死在 `mountpoint for devices not found`（内核没有 `devices` cgroup 控制器，也没有 UTS / IPC / user namespace、overlayfs、NAT 模块）。**替代 = `udocker`**（PRoot 用户态 chroot，不需要那些内核特性）：跑 `sh ./udocker-setup.sh` 一键装好，实测能拉能跑（hello-world / alpine / busybox，`--publish` 端口映射有效）。注意没有隔离，只跑可信镜像。完整证据见 [`../DOCKER_VERDICT.md`](../DOCKER_VERDICT.md) |
 | 忘了密码 / 想关掉密码登录 | ssh 用密钥进去后 `passwd root` 改密码（不会被开机覆盖，因为有 `/root/.n2-pw-set`）；要彻底禁用就 `passwd -l root` |
 | ssh 报 `Permission denied (publickey)` 但密码是对的 | 检查服务器是否真开了密码登录：`ps -ef \| grep 'sshd -p 8022'` 应看到 `PasswordAuthentication=yes`；看门狗拉起来的 sshd 也带这些参数 |

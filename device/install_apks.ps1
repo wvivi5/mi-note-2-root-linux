@@ -1,4 +1,4 @@
-# MIUI-friendly APK installer.
+﻿# MIUI-friendly APK installer.
 #
 # Why this exists: on MIUI, `adb install` / `pm install` (uid 2000) is hijacked to
 # com.miui.securitycenter/.permcenter.install.AdbInstallActivity, which refuses with
@@ -61,10 +61,10 @@ function Get-UiXml {
 
 # MIUI's installer walks through several screens; each has its own affirmative
 # button id.  Everything here is verified against a real Mi Note 2 (MIUI 9/10):
-#   1. risk dialog "来自未知来源..."  android:id/button1                     = "安装"
-#   2. installer page (vertical)     com.miui.packageinstaller:id/install_btn = "安装"
+#   1. risk dialog "鏉ヨ嚜鏈煡鏉ユ簮..."  android:id/button1                     = "瀹夎"
+#   2. installer page (vertical)     com.miui.packageinstaller:id/install_btn = "瀹夎"
 #      -> this is the one that actually installs; tapping the horizontal panel's
-#         ok_button ("继续安装") does nothing (that panel is not rendered).
+#         ok_button ("缁х画瀹夎") does nothing (that panel is not rendered).
 #   3. fallbacks                     :id/ok_button, :id/button1
 #   (never tap the *cancel* ids: android:id/button2, :id/cancel_button, :id/cancel_btn)
 $script:AffirmativeIds = @(

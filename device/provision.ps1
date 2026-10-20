@@ -1,4 +1,4 @@
-<#
+﻿<#
   provision.ps1 -- one-shot provisioning for a Xiaomi Note 2 (scorpio / MSM8996).
 
   Goal: after this script + a cold boot, the phone runs Linux as root and is
@@ -137,7 +137,7 @@ function Enable-MiuiAutostart {
         $hit = $null
         foreach ($n in $nodes) {
             $t = ('' + $n.text).Trim()
-            if ($t -eq '确定' -or $t -eq 'OK' -or $t -eq '同意') { $hit = $n; break }
+            if ($t -eq '纭畾' -or $t -eq 'OK' -or $t -eq '鍚屾剰') { $hit = $n; break }
         }
         if (-not $hit) { break }
         $b = Get-Bounds ('' + $hit.bounds)

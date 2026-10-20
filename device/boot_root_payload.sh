@@ -57,6 +57,27 @@ else
     trap 'rm -rf "$LOCKDIR"' EXIT
 fi
 
+# --- 0b. Boot forensics -----------------------------------------------------
+# Every power-on has to be able to explain itself.  When an auto-boot fails the
+# phone is off, so there is nothing to inspect -- unless the next run recorded
+# it.  This block captures, on every boot:
+#   * the PMIC power-on reason  -> RTC alarm / power key / charger insertion
+#   * the power-off reason      -> PS_HOLD = clean Android shutdown
+#   * the alarm that was armed when the phone went down (rtc now / alrm_*)
+#   * since_epoch               -> the PMIC's own uptime; if it did NOT keep
+#                                  counting across an off period, the PMIC lost
+#                                  power (battery removed / drained) and the
+#                                  alarm registers were reset with it.
+# Must run BEFORE section 2b, otherwise the values below are already the ones
+# this boot just armed.
+{
+    echo "--- boot forensics ---"
+    echo "system: $(date)"
+    echo "rtc: $(cat /sys/class/rtc/rtc0/time 2>/dev/null) $(cat /sys/class/rtc/rtc0/date 2>/dev/null) since_epoch=$(cat /sys/class/rtc/rtc0/since_epoch 2>/dev/null)"
+    echo "usb: type=$(cat /sys/class/power_supply/usb/type 2>/dev/null) online=$(cat /sys/class/power_supply/usb/online 2>/dev/null) batt=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)"
+    dmesg 2>/dev/null | grep -i -e "power-on reason" -e "power-off reason" | head -6
+} >> $LOG 2>&1
+
 # --- 0. Keep the app-side boot hook in sync with the staging area ------------
 # The hook has to live inside the app's data dir (that is where Termux:Boot
 # looks), and the adb shell user cannot write there.  Only root can, and root is
@@ -179,10 +200,16 @@ mount -t devpts devpts $R/dev/pts 2>>$LOG
 # (payload stuck in read() on a pipe), and anything placed after it would never
 # run.
 #
-# STEP = slot size in seconds.  Default 1800 = poll every 30 min, on :00 and
-#   :30 of the RTC's dial.  900 -> every 15 min;  3600 -> hourly.
-# Smaller STEP = a phone that was off comes back sooner after a power cut.
-# Override with   /data/local/tmp/n2-rtc-step   (plain integer seconds).
+# STEP = slot size in seconds.  Default 300 = poll every 5 min (:00 :05 :10 ...).
+#   With STEP as coarse as 1800 a phone that goes off at the wrong moment waits
+#   up to half an hour before it even has a chance to come back; 300 costs
+#   nothing (the daemon only rewrites the same register every 15s) and caps the
+#   worst-case delay at 5 min.  Override with /data/local/tmp/n2-rtc-step.
+#
+# PHASE = per-device offset in seconds, 0..STEP-1.  Ten phones on the same
+#   charger would otherwise hit the same slot to the second and start together;
+#   give each one a different phase (e.g. 0,30,60,...) and they boot 30s apart.
+#   Override with /data/local/tmp/n2-rtc-phase.  Still time-of-day only.
 # python3 and a working /dev/rtc0 live in the chroot (node created just above).
 if [ -e $R/dev/rtc0 ] && [ -x $R/usr/bin/python3 ]; then
     cat > $R/root/n2rtc.py <<'RTCPY'
@@ -206,9 +233,11 @@ def IOR(t, n, s): return (2 << 30) | (s << 16) | (ord(t) << 8) | n
 RTC_RD_TIME   = IOR('p', 0x09, SzT)
 RTC_WKALM_SET = IOW('p', 0x0f, SzW)
 
-step = int(sys.argv[1]) if len(sys.argv) > 1 else 1800
+step = int(sys.argv[1]) if len(sys.argv) > 1 else 300
 if step <= 0:
-    step = 1800
+    step = 300
+phase = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+phase %= step
 
 fd = os.open('/dev/rtc0', os.O_RDWR)
 buf = bytearray(SzT)
@@ -222,11 +251,18 @@ t = RtcTime.from_buffer(buf)
 # no alarm armed.  Without this, a slot firing while the phone is up would clear
 # the PMIC alarm, and a power cut in the few seconds before the daemon re-armed
 # would leave the phone off until someone pressed the power button.
+#
+# [slot-math-begin] -- pure function, no device access, testable off-target
+def next_slot(sod, step, phase=0, guard=45):
+    """Seconds from now-of-day `sod` to the next grid point t = phase (mod step)."""
+    delta = step - ((sod - phase) % step)
+    if delta <= guard:
+        delta += step
+    return delta
+# [slot-math-end]
+
 sod = t.hour * 3600 + t.min * 60 + t.sec
-guard = 45
-delta = step - (sod % step)
-if delta <= guard:
-    delta += step
+delta = next_slot(sod, step, phase)
 
 # The date fields below are only bookkeeping for the ioctl; the scheduling
 # above never looks at them.  Adding "delta" to the RTC's own clock (not to the
@@ -243,7 +279,9 @@ c = ctypes.create_string_buffer(SzW)
 ctypes.memmove(c, ctypes.byref(w), SzW)
 try:
     fcntl.ioctl(fd, RTC_WKALM_SET, c, True)
-    print("slot %02d:%02d:%02d (step %ds)" % (tm.tm_hour, tm.tm_min, tm.tm_sec, step), flush=True)
+    print("slot %02d:%02d:%02d (step %ds%s)" % (
+        tm.tm_hour, tm.tm_min, tm.tm_sec, step,
+        ", phase %ds" % phase if phase else ""), flush=True)
 except OSError as e:
     print("WKALM_SET fail:", e, flush=True)
 os.close(fd)
@@ -255,18 +293,33 @@ RTCPY
 # Keep a PMIC RTC wake alarm armed at the next time-of-day slot.  The date is
 # ignored; only the RTC's hh:mm:ss matters (see n2rtc.py).
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-echo $$ > /run/n2rtcalarm.pid
-STEP=${1:-1800}
-case "$STEP" in ''|*[!0-9]*) STEP=1800 ;; esac
+# This daemon is the only thing keeping a wake source armed.  At oom_score_adj 0
+# MIUI's LMK / cleaner reaps it silently (observed 2026-10-20: pid 5018 vanished
+# between 00:14 and 00:20, the armed slot then fired with the phone up and was
+# cleared, and the next power-off had no wake source at all -> dead until the
+# power key).  -1000 makes it unpickable, and n2watch restarts it if it dies.
+echo -1000 > /proc/self/oom_score_adj 2>/dev/null
+STEP=${1:-300}
+case "$STEP" in ''|*[!0-9]*) STEP=300 ;; esac
 [ "$STEP" -lt 300 ] && STEP=300
+PHASE=${2:-0}
+case "$PHASE" in ''|*[!0-9]*) PHASE=0 ;; esac
+BOOTID=$3
+[ -n "$BOOTID" ] || BOOTID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d ' \r\n')
+# Record "<boot_id> <pid>", never a bare pid: /run lives in the rootfs and is not
+# a tmpfs, so this file survives a reboot -- and after a reboot the old pid
+# belongs to some unrelated Android process, which made the payload believe the
+# daemon was already running.  See the arming block in boot_root_payload.sh.
+printf '%s %s\n' "$BOOTID" "$$" > /run/n2rtcalarm.pid
+printf '%s %s\n' "$STEP" "$PHASE" > /run/n2rtc.args
 LOG=/var/log/n2rtc.log
-echo "$(date) n2rtcalarm start pid=$$ step=${STEP}s (time-of-day only)" >> $LOG
+echo "$(date) n2rtcalarm start pid=$$ step=${STEP}s phase=${PHASE}s (time-of-day only)" >> $LOG
 # Re-arm every 15s.  The guard in n2rtc.py only moves the target on a slot
 # boundary, so log just when it changes -- a line every 15s would be ~5760
 # lines a day.
 LAST=
 while :; do
-    out=$(/usr/bin/python3 /root/n2rtc.py "$STEP" 2>&1)
+    out=$(/usr/bin/python3 /root/n2rtc.py "$STEP" "$PHASE" 2>&1)
     case "$out" in
         *fail*|"") echo "$(date) $out" >> $LOG ;;
         *) if [ "$out" != "$LAST" ]; then
@@ -281,17 +334,35 @@ done
 RTCS
     chmod 755 $R/root/n2rtcalarm
 
-    # Start it unless the recorded pid is still alive.  A pidfile avoids walking
-    # /proc, which is exactly what makes section 5d hang.
-    oldpid=$(cat $R/run/n2rtcalarm.pid 2>/dev/null)
-    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-        echo "--- rtc alarm daemon already running (pid $oldpid) ---" >> $LOG
+    # Is our daemon already running?  A pid alone cannot answer that: /run is a
+    # plain directory in the rootfs (no tmpfs, no init to clean it), so the file
+    # survives a reboot -- and right after a reboot that pid belongs to some
+    # unrelated Android process, so `kill -0` succeeds and we would skip arming
+    # completely.  That is exactly the "boots once, then never again" failure:
+    # the alarm that booted the phone was consumed at boot, no daemon re-armed
+    # it, and the next power-off had no wake source at all.  The record is now
+    # "<boot_id> <pid>": only "same boot AND pid alive" means ours.
+    BOOTID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d ' \r\n')
+    ST_BOOT=; ST_PID=
+    read ST_BOOT ST_PID < $R/run/n2rtcalarm.pid 2>/dev/null
+    if [ -n "$BOOTID" ] && [ "$ST_BOOT" = "$BOOTID" ] && [ -n "$ST_PID" ] && kill -0 "$ST_PID" 2>/dev/null; then
+        echo "--- rtc alarm daemon already running (pid $ST_PID, same boot) ---" >> $LOG
+    elif [ -z "$BOOTID" ] && [ -n "$ST_PID" ] && kill -0 "$ST_PID" 2>/dev/null; then
+        # no boot_id on this kernel (should not happen): fall back to the old test
+        echo "--- rtc alarm daemon already running (pid $ST_PID, no boot_id) ---" >> $LOG
     else
         RTC_STEP=$(cat /data/local/tmp/n2-rtc-step 2>/dev/null)
-        case "$RTC_STEP" in ''|*[!0-9]*) RTC_STEP=1800 ;; esac
-        setsid chroot $R /root/n2rtcalarm "$RTC_STEP" </dev/null >>$LOG 2>&1 &
+        case "$RTC_STEP" in ''|*[!0-9]*) RTC_STEP=300 ;; esac
+        RTC_PHASE=$(cat /data/local/tmp/n2-rtc-phase 2>/dev/null)
+        case "$RTC_PHASE" in ''|*[!0-9]*) RTC_PHASE=0 ;; esac
+        setsid chroot $R /root/n2rtcalarm "$RTC_STEP" "$RTC_PHASE" "$BOOTID" </dev/null >>$LOG 2>&1 &
         sleep 2
-        echo "--- rtc alarm armed (step=${RTC_STEP}s): $(tail -1 $R/var/log/n2rtc.log 2>/dev/null) ---" >> $LOG
+        # Proof, not hope: read back the alarm the PMIC actually holds.  If this
+        # line ever shows "alrm_time=?" the phone has no wake source and a
+        # power-off will strand it until someone presses the power key.
+        RTC_ALRM=$(sed -n 's/^alrm_time[^:]*: *//p' /proc/driver/rtc 2>/dev/null | head -1)
+        echo "--- rtc alarm armed (step=${RTC_STEP}s phase=${RTC_PHASE}s alrm_time=${RTC_ALRM:-?}) ---" >> $LOG
+        tail -1 $R/var/log/n2rtc.log >> $LOG 2>&1
     fi
 fi
 
@@ -434,6 +505,38 @@ while :; do
             echo $now > /run/n2watch.spawn 2>/dev/null
             setsid /root/n2watch >/dev/null 2>&1 &
             sleep 2
+        fi
+    fi
+    # The RTC alarm daemon must never stay dead: while it is gone a slot can fire
+    # with the phone up, the PMIC clears the alarm on delivery, and the next
+    # power-off then has no wake source at all.  Cheap check first (the pidfile),
+    # and only in the rare "looks dead" case scan /proc for a real survivor.
+    A_BOOT=; A_PID=
+    read A_BOOT A_PID < /run/n2rtcalarm.pid 2>/dev/null
+    if [ -z "$A_PID" ] || ! kill -0 "$A_PID" 2>/dev/null; then
+        # the payload may be starting it this very moment (it writes the record
+        # right after the fork), so look once more before doing anything
+        sleep 3
+        A_BOOT=; A_PID=
+        read A_BOOT A_PID < /run/n2rtcalarm.pid 2>/dev/null
+    fi
+    if [ -z "$A_PID" ] || ! kill -0 "$A_PID" 2>/dev/null; then
+        alive=0
+        for d in /proc/[0-9]*; do
+            [ "$(cat $d/comm 2>/dev/null)" = n2rtcalarm ] && { alive=1; break; }
+        done
+        if [ "$alive" -eq 0 ]; then
+            now=$(date +%s)
+            last=$(cat /run/n2rtc.spawn 2>/dev/null || echo 0)
+            if [ "$now" -gt "$((last + 60))" ]; then
+                echo $now > /run/n2rtc.spawn 2>/dev/null
+                read RTC_STEP RTC_PHASE < /run/n2rtc.args 2>/dev/null
+                [ -n "$RTC_STEP" ] || RTC_STEP=300
+                [ -n "$RTC_PHASE" ] || RTC_PHASE=0
+                echo "$(date) rtc alarm daemon gone -> restarting step=${RTC_STEP}s phase=${RTC_PHASE}s" >> /var/log/n2rtc.log
+                setsid /root/n2rtcalarm "$RTC_STEP" "$RTC_PHASE" </dev/null >>/var/log/n2rtc.log 2>&1 &
+                sleep 2
+            fi
         fi
     fi
     sleep 15

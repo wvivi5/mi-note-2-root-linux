@@ -95,7 +95,7 @@
 | 方式 | 说明 |
 |---|---|
 | **termux/termux-boot**（Termux:Boot） | 开机自启脚本（Termux 生态标准做法），负责"开机后自动起 Linux" |
-| **PMIC RTC 闹钟**（已实现，主方案） | ✅ **端到端实测通过**：`/dev/rtc0` 的 `RTC_WKALM_SET` 能把**已关机**的手机开机回来（纯软件）。按 RTC 自身 24h 时钟**每 30 分钟**（`:00`/`:30`）轮询，**不看日期**（RTC 停在 1970 也无所谓）。旋钮：`/data/local/tmp/n2-rtc-step`（秒） |
+| **PMIC RTC 闹钟**（已实现，主方案） | ✅ **端到端实测通过**：`/dev/rtc0` 的 `RTC_WKALM_SET` 能把**已关机**的手机开机回来（纯软件）。按 RTC 自身 24h 时钟**每 5 分钟**（默认 `step=300`，`:00 :05 :10 …`）轮询，**不看日期**（RTC 停在 1970 也无所谓）。旋钮：`/data/local/tmp/n2-rtc-step`（秒）、`n2-rtc-phase`（相位，多台错峰） |
 | ~~**`fastboot oem off-mode-charge`**~~ | ❌ **实测无效**：锁 BL 的 LK 不认该开关（0/1 均仍进充电模式）。但**已不需要**它 |
 | Linux Deploy 自启 / Tasker / 自启 App | 备选 |
 
