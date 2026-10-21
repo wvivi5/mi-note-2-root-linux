@@ -654,6 +654,38 @@ strings /proc/last_kmsg | grep -a Power-on      # 上一次开机（关机后仍
 - MiFlash 工具（`fh_loader.exe` / `QSaharaServer.exe`）也不在仓库里，`-Tools <目录>` 指定，
   或放在仓库的 `tools\MiFlash20220507\MiFlash20220507\`（脚本会自动找）。
 
+### 从零装好一台（步骤版）
+
+PC 侧准备（都要自己装/下载，仓库里没有）：
+
+| 要什么 | 干什么用 |
+|---|---|
+| Windows + adb（仓库 `tools\platform-tools\`，或自装） | 全部脚本的入口 |
+| **Qualcomm QDLoader 9008 驱动** | 不装的话，短接后设备管理器不出现 `9008 (COMx)`，刷机根本无从谈起 |
+| **MiFlash** | 只用它的 `fh_loader.exe` / `QSaharaServer.exe`（`flash_edl.ps1` 自动找 `tools\MiFlash20220507\...`） |
+| **scorpio 9.8.29 开发版线刷包**（`rom\scorpio_dev_9.8.29.tgz`，约 3GB） | 刷成内核地址对得上的那一版。属小米，**不随仓库发布** |
+
+六步：
+
+1. **进 9008**：手机关机 → **短接主板测试点**（必须人工，没法脚本化）→ 插 USB → 设备管理器出现
+   `Qualcomm HS-USB QDLoader 9008 (COMx)`。
+2. **刷机**：`.\device\flash_edl.ps1 -Wait -Reset`（多台连刷用 `-Loop`）。
+   刷完自动重启；IMEI / 传感器校准 / 密钥库分区**不写**，全部保留。
+3. **首次开机初始化**：连 WiFi → 设置 → 开发者选项里打开 **USB 调试**（+ USB 安装，
+   否则 `adb install` 被 MIUI 拦，见 §7）。`adb devices` 先是 `unauthorized`，在手机上点允许。
+4. **核对内核**：`.\device\collect-info.ps1 -Serial <SN>` 必须显示 `3.18.71-perf-ga01336f`；
+   对不上就**别部署**（写错地址会每次开机 panic 无限重启），要么刷对，要么重新量偏移。
+5. **部署**：`.\device\provision.ps1 -Serial <SN>`（内核校验 → 装 APK → 起 Termux:Boot 链 →
+   root → 铺 rootfs → 起 8022 sshd → 起看门狗 + RTC 守护 → 验收）。
+   然后 `.\device\connect.ps1 -Serial <SN>` 开 root shell。
+6. **验收**：
+   ```powershell
+   ssh -p 8022 root@<手机IP>                 # 能登 = 成功（密码 147147 或密钥）
+   grep -e "rtc alarm" -e "Power-on" /data/local/tmp/boot.log
+   ```
+   再做一次**关机自启**测试：手机里 `grep alrm_time /proc/driver/rtc` 确认有未来时刻
+   → 系统里点"关机" → 等最多 5 分钟自己开回来 → ssh 通（判读见 §6）。
+
 ## 9. 离线开箱包 & 发布
 
 - **打包**：`.\device\make-package.ps1`（或 `A-make-package.bat`）→ `dist\mi-note-2-root-linux\`
