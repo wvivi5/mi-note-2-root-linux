@@ -29,6 +29,17 @@ export PATH
 LOG=$H/boot.log
 R=$H/linux/rootfs
 
+# /data/data/com.termux is mode 700 and adb runs as uid 2000, so until sshd is up
+# there is nowhere readable to look when the chain fails.  Bind the log onto a
+# world-readable file in /data/local/tmp so every run stays inspectable over adb
+# even when it dies before the chroot comes up (seen: chain stopped after
+# Termux:Boot, 25 minutes with no sshd and no way to read a single log line).
+LOGM=/data/local/tmp/n2-boot.log
+mkdir -p /data/local/tmp 2>/dev/null
+touch "$LOG" "$LOGM" 2>/dev/null
+chmod 644 "$LOGM" 2>/dev/null
+mount --bind "$LOGM" "$LOG" 2>/dev/null
+
 echo "=== root payload start $(date) uid=$(id -u) ===" >> $LOG
 
 # --- 0a. Single instance -----------------------------------------------------
