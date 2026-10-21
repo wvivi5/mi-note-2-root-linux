@@ -28,6 +28,14 @@ param(
     [int]$MaxReboots = 3,
     [int]$WindowMinutes = 60,
     [string]$Log,
+    # Optional fleet watch: probe these machines over the LAN as well.  A phone
+    # that came back but never decrypted shows up over USB and gets rebooted;
+    # a phone that never powered on at all shows up here, and adb cannot help
+    # with that one - it needs a person to press the power button, so the whole
+    # point of watching is to say so out loud instead of staying silent.
+    [string[]]$LanIps = @(),
+    [string]$LanFile,
+    [int]$DarkMinutes = 15,
     [switch]$Once
 )
 $ErrorActionPreference = 'Continue'
@@ -65,17 +73,45 @@ function Say([string]$m, [string]$Color = 'Gray') {
     Write-Host $line -ForegroundColor $Color
     if ($script:Log) { Add-Content -Path $script:Log -Value $line }
 }
+# Fast TCP probe.  Test-NetConnection does DNS and a bunch of extra work on
+# every call; with a whole subnet to sweep every loop this is seconds per pass
+# instead of minutes.  The short timeout matters: a powered-off phone does not
+# refuse the connection, it simply does not answer.
+function Test-Port([string]$Ip, [int]$Port, [int]$TimeoutMs = 1500) {
+    $c = New-Object Net.Sockets.TcpClient
+    try {
+        $task = $c.ConnectAsync($Ip, $Port)
+        if (-not $task.Wait($TimeoutMs)) { return $false }
+        return $task.Status -eq [Threading.Tasks.TaskStatus]::RanToCompletion
+    }
+    catch { return $false }
+    finally { $c.Close() }
+}
 
 $adb = Resolve-Adb $Adb
 $script:Log = $Log
+if ($LanFile) {
+    foreach ($line in @(Get-Content $LanFile -ErrorAction SilentlyContinue)) {
+        $t = $line.Trim()
+        if ($t -and -not $t.StartsWith('#')) { $LanIps += $t }
+    }
+}
+$LanIps = @($LanIps | Where-Object { $_ } | Select-Object -Unique)
 Say "adb: $adb" Cyan
 Say "checking every ${IntervalSeconds}s; rebooting a phone stuck undecrypted for ${LockedSeconds}s" Cyan
 Say "budget: at most $MaxReboots reboots per phone per ${WindowMinutes} min" Cyan
+if ($LanIps.Count) {
+    Say ("also watching {0} machine(s) over the LAN on port 8022; dark for {1} min = needs a human" -f $LanIps.Count, $DarkMinutes) Cyan
+}
 
 # Per-device history, so a phone that never decrypts stops being rebooted and
 # starts being reported instead.
 $state = @{}
 $reboots = @{}
+# LAN side: first time we noticed a machine missing, plus the last time we said
+# anything about it, so a machine that stays dark gets reported hourly rather
+# than on every single pass.
+$dark = @{}
 
 function Test-Locked([string]$Serial) {
     $dec = ((& $adb -s $Serial shell getprop vold.decrypt 2>&1) -join ' ').Trim()
@@ -122,6 +158,28 @@ do {
         & $adb -s $s reboot 2>&1 | Out-Null
         $reboots[$s] += $now
         $state.Remove($s)
+    }
+    # LAN watch.  These machines are not on USB at the site, so the only way to
+    # notice one that failed to come back after an outage is to keep knocking on
+    # port 8022.  Coming back online clears the record, which matters because the
+    # interesting signal is "gone for a long time", not "gone right now" - during
+    # the outage itself every one of them is dark and that is expected.
+    foreach ($ip in $LanIps) {
+        if (Test-Port $ip 8022) {
+            if ($dark[$ip]) { Say "$ip is back online" Green; $dark.Remove($ip) }
+            continue
+        }
+        $now = Get-Date
+        if (-not $dark[$ip]) {
+            $dark[$ip] = @{ Since = $now; LastSaid = [datetime]::MinValue }
+            Say "$ip is not answering on 8022 (counting from now)" Yellow
+            continue
+        }
+        $gone = [int]((Get-Date) - $dark[$ip].Since).TotalMinutes
+        if ($gone -ge $DarkMinutes -and (($now - $dark[$ip].LastSaid).TotalMinutes -ge 60)) {
+            Say "$ip has been dark for $gone min - it did not power back on, someone needs to press the power button" Red
+            $dark[$ip].LastSaid = $now
+        }
     }
     if (-not $Once) { Start-Sleep -Seconds $IntervalSeconds }
 } until ($Once)

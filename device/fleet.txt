@@ -1,0 +1,11 @@
+# Machines to watch over the LAN, one per line.  fde-watchdog.ps1 probes each
+# one on port 8022 (the Linux chroot sshd) and complains if a machine has been
+# dark for longer than -DarkMinutes - that is the case adb cannot fix: the phone
+# never powered on, so nobody is there to be rebooted and a human has to press
+# the power button.
+#
+# Point the watchdog at this file:
+#   .\fde-watchdog.bat -LanFile .\fleet.txt
+#
+# Put a # in front of a line to leave a machine out without deleting it.
+192.168.68.185
