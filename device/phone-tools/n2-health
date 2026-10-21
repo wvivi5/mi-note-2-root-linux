@@ -1,0 +1,31 @@
+#!/bin/sh
+# n2-health.sh -- one-shot health report used after every debloat batch.
+#
+# Deliberately checks the things that have actually bitten us: boot state, the
+# two sshd listeners, the frpc tunnel, whether system_server is crash-looping,
+# and the resident processes that the debloat was meant to remove.
+echo "=== boot ==="
+echo "  boot_completed=$(getprop sys.boot_completed)  uptime=$(cut -d' ' -f1 /proc/uptime)s"
+echo "  packages installed=$(n2-pm cmd package list packages | grep -c .)  disabled=$(n2-pm pm list packages -d | grep -c .)"
+echo
+echo "=== chain ==="
+echo "  sshd(8022/8023)=$(ps -A 2>/dev/null | grep -c '[s]shd')  frpc=$(pidof frpc | tr -d '\r')"
+echo "  listeners: $(grep -icE ':1F56|:1F57' /proc/net/tcp /proc/net/tcp6 2>/dev/null | paste -sd+ | bc)"
+echo
+echo "=== system_server stability (FATAL count in this boot) ==="
+n2-pm logcat -d -b all 2>/dev/null | grep -c 'FATAL EXCEPTION IN SYSTEM PROCESS' | sed 's/^/  fatal=/'
+n2-pm logcat -d -b all 2>/dev/null | grep -c 'find system app' | sed 's/^/  missing-app-error=/'
+echo
+echo "=== memory ==="
+grep -E 'MemTotal|MemAvailable' /proc/meminfo | sed 's/^/  /'
+echo
+echo "=== top processes ==="
+n2-pm dumpsys meminfo 2>/dev/null | sed -n '/Total PSS by process/,/^$/p' | head -18 | sed 's/^/  /'
+echo
+echo "=== debloat-plan packages still resident ==="
+for p in systemAdSolution miui.analytics miui.hybrid xiaomi.joyose miui.weather2 \
+         miui.player miui.video miui.voiceassist sohu.inputmethod miui.daemon; do
+    pid=$(ps -A 2>/dev/null | grep "$p" | awk '{print $2}' | paste -sd, )
+    [ -n "$pid" ] && echo "  RUNNING $p pid=$pid"
+done
+echo "  (nothing listed above = all target processes are gone)"

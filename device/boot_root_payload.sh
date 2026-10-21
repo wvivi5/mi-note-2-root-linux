@@ -848,6 +848,349 @@ echo "--- listening (1F56=8022 linux, 1F57=8023 termux) ---" >> $LOG
 grep -iE ":1F56|:1F57" /proc/net/tcp >> $LOG 2>&1
 echo "=== root payload done $(date) ===" >> $LOG
 
+# --- 5e. phone-side helpers (n2-pm and friends) -------------------------------
+# Why: n2-pm is the only way to touch the package manager once adb is gone --
+# our sshd runs in u:r:kernel:s0 and servicemanager refuses pm/cmd from that
+# domain, so it has to re-enter as u:r:shell:s0 (README section 7).
+# Until 2026-10-21 these helpers existed only on 4bbc97a9 because they had been
+# scp'd there by hand, and device/ had no copy of them at all.  A freshly
+# provisioned machine (85126a4c) therefore had none of them, which made the
+# documented "fix it over ssh when USB is dead" path purely theoretical -- and
+# it is exactly the machine that needed it.  They now live in
+# device/phone-tools/ and are re-installed on every boot so this cannot rot.
+# Keep this block in sync with device/phone-tools/ (it is generated from there).
+mkdir -p $R/usr/local/bin 2>>$LOG
+cat > $R/usr/local/bin/n2-pm <<'N2_N2_PM'
+#!/bin/sh
+# n2-pm.sh -- run Android pm/cmd from inside the Linux chroot, as the `shell`
+# SELinux domain.
+#
+# Identity note: our sshd runs in u:r:kernel:s0, and servicemanager refuses
+# pm/cmd from that domain even though SELinux is permissive - the first version
+# of the debloat tooling hit this and reported phantom results.  adb works
+# because it is uid 2000 in u:r:shell:s0.  runcon lets us adopt exactly that
+# identity from root, which is the same thing restore-debloat.ps1 documents.
+# `pm` is a shell script (its #!/system/bin/sh is resolved after the chroot,
+# so it works as-is) while `cmd` is an ELF binary - exec the target directly
+# rather than forcing it through sh, which would try to parse ELF as a script.
+R=/proc/1/root
+exec chroot $R /system/bin/env \
+    PATH=/system/bin \
+    ANDROID_ROOT=/system \
+    ANDROID_DATA=/data \
+    EXTERNAL_STORAGE=/sdcard \
+    /system/bin/runcon u:r:shell:s0 \
+    /system/bin/"$@"
+N2_N2_PM
+chmod 755 $R/usr/local/bin/n2-pm 2>>$LOG
+
+cat > $R/usr/local/bin/n2-debloat-apply <<'N2_N2_DEBLOAT_APPLY'
+#!/bin/sh
+# n2-debloat-apply.sh -- remove a batch of packages for user 0 and report what
+# actually happened, using the runcon identity pm requires.
+#
+# Run without arguments to print the current state.  It does NOT reboot: the
+# reboot has to come from outside, because the process dies with it.  Callers
+# should reboot and then re-run this with no arguments to see which packages
+# really stayed gone - MIUI puts a subset of them straight back on the next
+# boot, and that subset is what separates a real debloat from a wasted one.
+#
+# Never accepts com.xiaomi.market.  MIUI's SecurityManagerService looks that
+# name up on every boot; with it missing, system_server throws every 6-8 s and
+# the phone parks at the MI logo.  That is the one package that turns a debloat
+# into a bootloop, so the guard lives here as well as in debloat.ps1.
+FORBIDDEN=com.xiaomi.market
+
+if [ $# -eq 0 ]; then
+    echo "=== installed for user 0: $(n2-pm cmd package list packages | grep -c .) ==="
+    echo "=== disabled: $(n2-pm pm list packages -d | grep -c .) ==="
+    n2-pm pm list packages -d | sed 's/^package:/  disabled: /'
+    exit 0
+fi
+
+for p in "$@"; do
+    if [ "$p" = "$FORBIDDEN" ]; then
+        echo "REFUSED  $p  (boot-critical: SecurityManagerService looks it up by name)"
+        continue
+    fi
+    out=$(n2-pm pm uninstall --user 0 "$p" 2>&1 | tr -d '\r')
+    now=$(n2-pm cmd package list packages | sed 's/^package://' | grep -qx "$p" && echo still-there || echo removed)
+    printf '%-40s pm=%-10s state=%s\n' "$p" "$(echo "$out" | tail -1)" "$now"
+done
+
+echo
+echo "installed for user 0 now: $(n2-pm cmd package list packages | grep -c .)"
+N2_N2_DEBLOAT_APPLY
+chmod 755 $R/usr/local/bin/n2-debloat-apply 2>>$LOG
+
+cat > $R/usr/local/bin/n2-debloat-loc <<'N2_N2_DEBLOAT_LOC'
+#!/bin/sh
+# n2-debloat-loc.sh -- correlate "did MIUI put it back?" with "where does its
+# APK live?".
+#
+# After two rounds, 15 of 20 uninstalled-for-user packages came back on the
+# next boot while 5 stayed gone.  That is a rule, not noise, and the most
+# likely rule is the priv-app split: /system/priv-app holds packages granted
+# privileged permissions, which MIUI treats as part of the platform.  If the
+# split explains every package, we can predict the outcome before touching a
+# phone instead of discovering it after a reboot.
+for p in \
+    com.miui.player com.miui.video com.miui.newhome com.miui.voiceassist \
+    com.sohu.inputmethod.sogou.xiaomi com.miui.daemon com.xiaomi.gamecenter \
+    com.xiaomi.gamecenter.sdk.service com.xiaomi.scanner com.miui.compass \
+    com.miui.screenrecorder com.miui.touchassistant com.xiaomi.vipaccount \
+    com.miui.smarttravel com.xiaomi.drivemode com.mi.health com.mi.dlabs.vr \
+    com.miui.bugreport com.android.browser com.miui.translationservice \
+    com.miui.userguide com.android.egg com.miui.hybrid.accessory \
+    com.miui.translation.xmcloud com.miui.translation.youdao \
+    com.miui.systemAdSolution com.miui.hybrid com.xiaomi.joyose \
+    com.miui.analytics com.miui.weather2
+do
+    path=$(n2-pm pm path "$p" 2>/dev/null | head -1 | sed 's/^package://')
+    case "$path" in
+        */priv-app/*) where=priv-app ;;
+        */app/*)      where=app ;;
+        '')           where=GONE ;;
+        *)            where=other ;;
+    esac
+    printf '%-40s %-9s %s\n' "$p" "$where" "$path"
+done
+N2_N2_DEBLOAT_LOC
+chmod 755 $R/usr/local/bin/n2-debloat-loc 2>>$LOG
+
+cat > $R/usr/local/bin/n2-debloat-state <<'N2_N2_DEBLOAT_STATE'
+#!/bin/sh
+# n2-debloat-state.sh -- report, for every package in the debloat plan, whether
+# it is currently installed for user 0 and whether it is disabled.
+#
+# Written because `pm disable-user` and even `pm uninstall --user 0` are both
+# reverted by MIUI at boot for a *subset* of packages, and the subset is not
+# the same for the two operations.  Only the package list itself is trustworthy,
+# so this reads it and prints one line per package.
+LIST=$(n2-pm cmd package list packages | sed 's/^package://')
+DISABLED=$(n2-pm pm list packages -d | sed 's/^package://')
+
+for p in \
+    com.miui.player com.miui.video com.miui.newhome com.miui.voiceassist \
+    com.sohu.inputmethod.sogou.xiaomi \
+    com.miui.daemon com.xiaomi.gamecenter com.xiaomi.gamecenter.sdk.service \
+    com.xiaomi.scanner com.miui.compass \
+    com.miui.screenrecorder com.miui.touchassistant com.xiaomi.vipaccount \
+    com.miui.smarttravel com.xiaomi.drivemode \
+    com.mi.health com.mi.dlabs.vr com.miui.bugreport com.android.browser \
+    com.miui.translationservice \
+    com.miui.userguide com.android.egg com.miui.hybrid.accessory \
+    com.miui.translation.xmcloud com.miui.translation.youdao \
+    com.miui.systemAdSolution com.miui.hybrid com.xiaomi.joyose \
+    com.miui.analytics com.miui.weather2 com.xiaomi.market
+do
+    inst=no; dis=no
+    echo "$LIST" | grep -qx "$p" && inst=yes
+    echo "$DISABLED" | grep -qx "$p" && dis=yes
+    printf '%-40s installed=%-3s disabled=%s\n' "$p" "$inst" "$dis"
+done
+
+echo
+echo "total installed for user 0: $(echo "$LIST" | grep -c .)"
+echo "total disabled: $(echo "$DISABLED" | grep -c .)"
+N2_N2_DEBLOAT_STATE
+chmod 755 $R/usr/local/bin/n2-debloat-state 2>>$LOG
+
+cat > $R/usr/local/bin/n2-health <<'N2_N2_HEALTH'
+#!/bin/sh
+# n2-health.sh -- one-shot health report used after every debloat batch.
+#
+# Deliberately checks the things that have actually bitten us: boot state, the
+# two sshd listeners, the frpc tunnel, whether system_server is crash-looping,
+# and the resident processes that the debloat was meant to remove.
+echo "=== boot ==="
+echo "  boot_completed=$(getprop sys.boot_completed)  uptime=$(cut -d' ' -f1 /proc/uptime)s"
+echo "  packages installed=$(n2-pm cmd package list packages | grep -c .)  disabled=$(n2-pm pm list packages -d | grep -c .)"
+echo
+echo "=== chain ==="
+echo "  sshd(8022/8023)=$(ps -A 2>/dev/null | grep -c '[s]shd')  frpc=$(pidof frpc | tr -d '\r')"
+echo "  listeners: $(grep -icE ':1F56|:1F57' /proc/net/tcp /proc/net/tcp6 2>/dev/null | paste -sd+ | bc)"
+echo
+echo "=== system_server stability (FATAL count in this boot) ==="
+n2-pm logcat -d -b all 2>/dev/null | grep -c 'FATAL EXCEPTION IN SYSTEM PROCESS' | sed 's/^/  fatal=/'
+n2-pm logcat -d -b all 2>/dev/null | grep -c 'find system app' | sed 's/^/  missing-app-error=/'
+echo
+echo "=== memory ==="
+grep -E 'MemTotal|MemAvailable' /proc/meminfo | sed 's/^/  /'
+echo
+echo "=== top processes ==="
+n2-pm dumpsys meminfo 2>/dev/null | sed -n '/Total PSS by process/,/^$/p' | head -18 | sed 's/^/  /'
+echo
+echo "=== debloat-plan packages still resident ==="
+for p in systemAdSolution miui.analytics miui.hybrid xiaomi.joyose miui.weather2 \
+         miui.player miui.video miui.voiceassist sohu.inputmethod miui.daemon; do
+    pid=$(ps -A 2>/dev/null | grep "$p" | awk '{print $2}' | paste -sd, )
+    [ -n "$pid" ] && echo "  RUNNING $p pid=$pid"
+done
+echo "  (nothing listed above = all target processes are gone)"
+N2_N2_HEALTH
+chmod 755 $R/usr/local/bin/n2-health 2>>$LOG
+
+cat > $R/usr/local/bin/n2-mem <<'N2_N2_MEM'
+#!/bin/sh
+# n2-mem.sh -- how much of the debloat actually freed RAM.
+#
+# Two dead ends are documented here so they are not retried:
+#   * `dumpsys meminfo` through runcon hits the 10 s service timeout - it walks
+#     every process over binder, and runcon's identity is slow to answer.
+#   * `ps -A -o PID,RSS,ARGS` prints nothing at all in this chroot, even though
+#     plain `ps -A` works.  So do not use ps for this.
+# /proc is mounted and readable, so walk it directly: cmdline is NUL-separated
+# argv, and statm's second field is RSS in 4 kB pages.
+#
+# Pre-debloat baseline (PSS, 9 resident processes, 148.9 MB):
+#   baidu.input_mi 40.4  sogou 27.7  hybrid 17.6  systemAdSolution 17.3
+#   daemon 11.5  joyose 11.1  analytics 8.9  weather2 8.0  systemAdSolution:ui 6.5
+PATS='com.miui.systemAdSolution|com.miui.analytics|com.miui.hybrid|com.xiaomi.joyose|com.miui.weather2|com.miui.player|com.miui.video|com.miui.voiceassist|com.sohu.inputmethod|com.baidu.input_mi|com.miui.daemon|com.miui.newhome|com.mi.health|com.miui.bugreport|com.mi.dlabs.vr'
+
+echo "=== resident debloat-target processes (RSS from /proc/<pid>/statm) ==="
+tot=0; n=0
+for d in /proc/[0-9]*; do
+    cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+    [ -z "$cmd" ] && continue
+    echo "$cmd" | grep -qE "$PATS" || continue
+    rss=$(awk '{print $2}' "$d/statm" 2>/dev/null)
+    [ -z "$rss" ] && continue
+    kb=$((rss * 4))
+    tot=$((tot + kb)); n=$((n + 1))
+    printf '  %8d kB  pid=%-6s %s\n' "$kb" "$(basename "$d")" "$(echo "$cmd" | cut -c1-70)"
+done
+printf '  -------------------------------------------\n'
+printf '  total: %d kB = %.1f MB across %d processes\n' "$tot" "$(echo "scale=1; $tot/1024" | bc)" "$n"
+
+echo
+echo "=== whole phone ==="
+grep -E 'MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree' /proc/meminfo | sed 's/^/  /'
+echo
+echo "=== packages ==="
+echo "  installed for user 0: $(n2-pm cmd package list packages | grep -c .)"
+echo "  disabled:             $(n2-pm pm list packages -d | grep -c .)"
+N2_N2_MEM
+chmod 755 $R/usr/local/bin/n2-mem 2>>$LOG
+
+cat > $R/usr/local/bin/n2-hide <<'N2_N2_HIDE'
+#!/bin/sh
+# n2-hide.sh -- hide/unhide packages for user 0.  DIAGNOSTIC USE ONLY, and even
+# then read this whole header first: hiding crashes system_server on this ROM.
+#
+# What was measured on 85126a4c (MIUI 9.8.29 / Android 8, same build as
+# 4bbc97a9 -- so this is not a "different ROM" story):
+#
+#   * `pm uninstall --user 0 <pkg>` -- MIUI re-installs the package on the next
+#     boot.  12 of 13 candidates came back every single time; only
+#     com.miui.screenrecorder happened to stay gone.  Nothing is logged and
+#     package-restrictions.xml quietly loses its inst="false" attribute.
+#   * `pm disable-user --user 0 <pkg>` -- reverted as well (enabled=3 -> 0).
+#   * `pm hide --user 0 <pkg>` -- the hidden="true" flag DOES survive a reboot
+#     (measured 14/14), which makes it look like the answer.  It is not:
+#
+#     MIUI's SecurityManagerService runs checkAppHidden() for hidden packages
+#     early in boot -- before boot_completed.  Each un-hide it decides to do
+#     goes through setApplicationHiddenSettingAsUser() ->
+#     PackageManagerService.sendSessionCommitBroadcast(), and AMS refuses to
+#     broadcast that early:
+#
+#       IllegalStateException: Cannot broadcast before boot completed
+#       at ...ActivityManagerService.verifyBroadcastLocked
+#       at ...PackageManagerService.sendPackageAddedForUser
+#       at miui.security.SecurityManagerCompat.checkAppHidden
+#       at com.miui.server.SecurityManagerService.checkEnabled
+#       *** FATAL EXCEPTION IN SYSTEM PROCESS: Thread-3 ***
+#
+#     Measured with 30 hidden packages: system_server died twice on the way up
+#     (21:14:35 and 21:14:41), MIUI managed to un-hide 2 packages before
+#     crashing, and the phone only reached boot_completed because system_server
+#     restarts itself.  That is a coin flip away from a MI-logo park, so hiding
+#     is off the table for these phones.
+#
+# Conclusion for 85126a4c-style machines: only /data/app packages can really be
+# removed (pm uninstall works on those and MIUI leaves them alone); everything
+# MIUI reinstalls is untouchable without modifying the read-only /system image.
+# `n2-hide` is kept because -l is genuinely useful (it separates "hidden" from
+# "uninstalled", which `pm list packages` cannot) and because proving the crash
+# again on another unit takes one command.  Hiding itself now needs -f.
+#
+# Identity: `adb shell pm hide` fails with "Neither user 2000 nor current
+# process has android.permission.MANAGE_USERS".  n2-pm runs as uid 0 inside the
+# same chroot, so Android's Java permission check passes; only the SELinux
+# domain has to be swapped, which is what n2-pm's runcon does.
+
+usage() {
+    cat <<'USAGE'
+usage: n2-hide [-l] [-u <package>...] [-f] <package>...
+  -l, --list     list the packages that are currently hidden
+  -u, --unhide   unhide instead of hide (rollback, always allowed)
+  -f, --force    actually hide; without it this command only explains why hiding
+                 crashes system_server on this ROM (see the header)
+USAGE
+}
+
+RESTRICTIONS=/proc/1/root/data/system/users/0/package-restrictions.xml
+[ -r "$RESTRICTIONS" ] || RESTRICTIONS=/data/system/users/0/package-restrictions.xml
+
+case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -l|--list)
+        # hidden="true" only exists in the per-user restrictions file; a hidden
+        # package simply disappears from `pm list packages`, so that command
+        # cannot tell hidden from uninstalled.
+        if [ ! -r "$RESTRICTIONS" ]; then
+            echo "cannot read $RESTRICTIONS" >&2
+            exit 1
+        fi
+        tr '>' '\n' < "$RESTRICTIONS" \
+          | grep 'hidden="true"' \
+          | sed -e 's/.*name="//' -e 's/".*//'
+        exit 0
+        ;;
+    -u|--unhide)
+        shift
+        [ $# -gt 0 ] || { usage; exit 2; }
+        for p in "$@"; do
+            out=$(n2-pm pm unhide --user 0 "$p" 2>&1 | tr -d '\r')
+            printf '%-42s %s\n' "$p" "${out:-no output}"
+        done
+        exit 0
+        ;;
+    -f|--force)
+        FORCE=1
+        shift
+        ;;
+    ''|-)
+        usage
+        exit 2
+        ;;
+esac
+
+if [ "${1:-}" = "" ]; then
+    usage
+    exit 2
+fi
+
+for p in "$@"; do
+    # MIUI's SecurityManagerService looks this one up by name on every boot;
+    # missing, it throws every 6-8 s and the phone parks at the MI logo.
+    if [ "$p" = com.xiaomi.market ]; then
+        echo "REFUSED  $p  (boot-critical: SecurityManagerService looks it up by name)"
+        continue
+    fi
+    if [ "$FORCE" != 1 ] && [ "${N2_HIDE_FORCE:-0}" != 1 ]; then
+        echo "REFUSED  $p  (hiding crashes system_server at boot; pass -f to override)"
+        continue
+    fi
+    out=$(n2-pm pm hide --user 0 "$p" 2>&1 | tr -d '\r')
+    printf '%-42s %s\n' "$p" "${out:-no output}"
+done
+N2_N2_HIDE
+chmod 755 $R/usr/local/bin/n2-hide 2>>$LOG
+
+# --- end 5e ---------------------------------------------------------------
+
 # --- 5c. frpc: reverse tunnel to your own frps (optional, supervised) ----------
 # Why a supervisor and not "start it once at boot":
 #   * frp >= 0.60 defaults to loginFailExit=true, so frpc EXITS when frps is

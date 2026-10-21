@@ -1,0 +1,35 @@
+#!/bin/sh
+# n2-debloat-apply.sh -- remove a batch of packages for user 0 and report what
+# actually happened, using the runcon identity pm requires.
+#
+# Run without arguments to print the current state.  It does NOT reboot: the
+# reboot has to come from outside, because the process dies with it.  Callers
+# should reboot and then re-run this with no arguments to see which packages
+# really stayed gone - MIUI puts a subset of them straight back on the next
+# boot, and that subset is what separates a real debloat from a wasted one.
+#
+# Never accepts com.xiaomi.market.  MIUI's SecurityManagerService looks that
+# name up on every boot; with it missing, system_server throws every 6-8 s and
+# the phone parks at the MI logo.  That is the one package that turns a debloat
+# into a bootloop, so the guard lives here as well as in debloat.ps1.
+FORBIDDEN=com.xiaomi.market
+
+if [ $# -eq 0 ]; then
+    echo "=== installed for user 0: $(n2-pm cmd package list packages | grep -c .) ==="
+    echo "=== disabled: $(n2-pm pm list packages -d | grep -c .) ==="
+    n2-pm pm list packages -d | sed 's/^package:/  disabled: /'
+    exit 0
+fi
+
+for p in "$@"; do
+    if [ "$p" = "$FORBIDDEN" ]; then
+        echo "REFUSED  $p  (boot-critical: SecurityManagerService looks it up by name)"
+        continue
+    fi
+    out=$(n2-pm pm uninstall --user 0 "$p" 2>&1 | tr -d '\r')
+    now=$(n2-pm cmd package list packages | sed 's/^package://' | grep -qx "$p" && echo still-there || echo removed)
+    printf '%-40s pm=%-10s state=%s\n' "$p" "$(echo "$out" | tail -1)" "$now"
+done
+
+echo
+echo "installed for user 0 now: $(n2-pm cmd package list packages | grep -c .)"

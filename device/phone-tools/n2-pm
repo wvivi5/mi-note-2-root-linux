@@ -1,0 +1,20 @@
+#!/bin/sh
+# n2-pm.sh -- run Android pm/cmd from inside the Linux chroot, as the `shell`
+# SELinux domain.
+#
+# Identity note: our sshd runs in u:r:kernel:s0, and servicemanager refuses
+# pm/cmd from that domain even though SELinux is permissive - the first version
+# of the debloat tooling hit this and reported phantom results.  adb works
+# because it is uid 2000 in u:r:shell:s0.  runcon lets us adopt exactly that
+# identity from root, which is the same thing restore-debloat.ps1 documents.
+# `pm` is a shell script (its #!/system/bin/sh is resolved after the chroot,
+# so it works as-is) while `cmd` is an ELF binary - exec the target directly
+# rather than forcing it through sh, which would try to parse ELF as a script.
+R=/proc/1/root
+exec chroot $R /system/bin/env \
+    PATH=/system/bin \
+    ANDROID_ROOT=/system \
+    ANDROID_DATA=/data \
+    EXTERNAL_STORAGE=/sdcard \
+    /system/bin/runcon u:r:shell:s0 \
+    /system/bin/"$@"

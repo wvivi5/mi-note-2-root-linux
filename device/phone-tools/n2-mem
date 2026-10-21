@@ -1,0 +1,38 @@
+#!/bin/sh
+# n2-mem.sh -- how much of the debloat actually freed RAM.
+#
+# Two dead ends are documented here so they are not retried:
+#   * `dumpsys meminfo` through runcon hits the 10 s service timeout - it walks
+#     every process over binder, and runcon's identity is slow to answer.
+#   * `ps -A -o PID,RSS,ARGS` prints nothing at all in this chroot, even though
+#     plain `ps -A` works.  So do not use ps for this.
+# /proc is mounted and readable, so walk it directly: cmdline is NUL-separated
+# argv, and statm's second field is RSS in 4 kB pages.
+#
+# Pre-debloat baseline (PSS, 9 resident processes, 148.9 MB):
+#   baidu.input_mi 40.4  sogou 27.7  hybrid 17.6  systemAdSolution 17.3
+#   daemon 11.5  joyose 11.1  analytics 8.9  weather2 8.0  systemAdSolution:ui 6.5
+PATS='com.miui.systemAdSolution|com.miui.analytics|com.miui.hybrid|com.xiaomi.joyose|com.miui.weather2|com.miui.player|com.miui.video|com.miui.voiceassist|com.sohu.inputmethod|com.baidu.input_mi|com.miui.daemon|com.miui.newhome|com.mi.health|com.miui.bugreport|com.mi.dlabs.vr'
+
+echo "=== resident debloat-target processes (RSS from /proc/<pid>/statm) ==="
+tot=0; n=0
+for d in /proc/[0-9]*; do
+    cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+    [ -z "$cmd" ] && continue
+    echo "$cmd" | grep -qE "$PATS" || continue
+    rss=$(awk '{print $2}' "$d/statm" 2>/dev/null)
+    [ -z "$rss" ] && continue
+    kb=$((rss * 4))
+    tot=$((tot + kb)); n=$((n + 1))
+    printf '  %8d kB  pid=%-6s %s\n' "$kb" "$(basename "$d")" "$(echo "$cmd" | cut -c1-70)"
+done
+printf '  -------------------------------------------\n'
+printf '  total: %d kB = %.1f MB across %d processes\n' "$tot" "$(echo "scale=1; $tot/1024" | bc)" "$n"
+
+echo
+echo "=== whole phone ==="
+grep -E 'MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree' /proc/meminfo | sed 's/^/  /'
+echo
+echo "=== packages ==="
+echo "  installed for user 0: $(n2-pm cmd package list packages | grep -c .)"
+echo "  disabled:             $(n2-pm pm list packages -d | grep -c .)"

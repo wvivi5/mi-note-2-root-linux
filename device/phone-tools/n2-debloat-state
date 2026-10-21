@@ -1,0 +1,34 @@
+#!/bin/sh
+# n2-debloat-state.sh -- report, for every package in the debloat plan, whether
+# it is currently installed for user 0 and whether it is disabled.
+#
+# Written because `pm disable-user` and even `pm uninstall --user 0` are both
+# reverted by MIUI at boot for a *subset* of packages, and the subset is not
+# the same for the two operations.  Only the package list itself is trustworthy,
+# so this reads it and prints one line per package.
+LIST=$(n2-pm cmd package list packages | sed 's/^package://')
+DISABLED=$(n2-pm pm list packages -d | sed 's/^package://')
+
+for p in \
+    com.miui.player com.miui.video com.miui.newhome com.miui.voiceassist \
+    com.sohu.inputmethod.sogou.xiaomi \
+    com.miui.daemon com.xiaomi.gamecenter com.xiaomi.gamecenter.sdk.service \
+    com.xiaomi.scanner com.miui.compass \
+    com.miui.screenrecorder com.miui.touchassistant com.xiaomi.vipaccount \
+    com.miui.smarttravel com.xiaomi.drivemode \
+    com.mi.health com.mi.dlabs.vr com.miui.bugreport com.android.browser \
+    com.miui.translationservice \
+    com.miui.userguide com.android.egg com.miui.hybrid.accessory \
+    com.miui.translation.xmcloud com.miui.translation.youdao \
+    com.miui.systemAdSolution com.miui.hybrid com.xiaomi.joyose \
+    com.miui.analytics com.miui.weather2 com.xiaomi.market
+do
+    inst=no; dis=no
+    echo "$LIST" | grep -qx "$p" && inst=yes
+    echo "$DISABLED" | grep -qx "$p" && dis=yes
+    printf '%-40s installed=%-3s disabled=%s\n' "$p" "$inst" "$dis"
+done
+
+echo
+echo "total installed for user 0: $(echo "$LIST" | grep -c .)"
+echo "total disabled: $(echo "$DISABLED" | grep -c .)"

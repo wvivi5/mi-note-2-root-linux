@@ -1,0 +1,112 @@
+#!/bin/sh
+# n2-hide.sh -- hide/unhide packages for user 0.  DIAGNOSTIC USE ONLY, and even
+# then read this whole header first: hiding crashes system_server on this ROM.
+#
+# What was measured on 85126a4c (MIUI 9.8.29 / Android 8, same build as
+# 4bbc97a9 -- so this is not a "different ROM" story):
+#
+#   * `pm uninstall --user 0 <pkg>` -- MIUI re-installs the package on the next
+#     boot.  12 of 13 candidates came back every single time; only
+#     com.miui.screenrecorder happened to stay gone.  Nothing is logged and
+#     package-restrictions.xml quietly loses its inst="false" attribute.
+#   * `pm disable-user --user 0 <pkg>` -- reverted as well (enabled=3 -> 0).
+#   * `pm hide --user 0 <pkg>` -- the hidden="true" flag DOES survive a reboot
+#     (measured 14/14), which makes it look like the answer.  It is not:
+#
+#     MIUI's SecurityManagerService runs checkAppHidden() for hidden packages
+#     early in boot -- before boot_completed.  Each un-hide it decides to do
+#     goes through setApplicationHiddenSettingAsUser() ->
+#     PackageManagerService.sendSessionCommitBroadcast(), and AMS refuses to
+#     broadcast that early:
+#
+#       IllegalStateException: Cannot broadcast before boot completed
+#       at ...ActivityManagerService.verifyBroadcastLocked
+#       at ...PackageManagerService.sendPackageAddedForUser
+#       at miui.security.SecurityManagerCompat.checkAppHidden
+#       at com.miui.server.SecurityManagerService.checkEnabled
+#       *** FATAL EXCEPTION IN SYSTEM PROCESS: Thread-3 ***
+#
+#     Measured with 30 hidden packages: system_server died twice on the way up
+#     (21:14:35 and 21:14:41), MIUI managed to un-hide 2 packages before
+#     crashing, and the phone only reached boot_completed because system_server
+#     restarts itself.  That is a coin flip away from a MI-logo park, so hiding
+#     is off the table for these phones.
+#
+# Conclusion for 85126a4c-style machines: only /data/app packages can really be
+# removed (pm uninstall works on those and MIUI leaves them alone); everything
+# MIUI reinstalls is untouchable without modifying the read-only /system image.
+# `n2-hide` is kept because -l is genuinely useful (it separates "hidden" from
+# "uninstalled", which `pm list packages` cannot) and because proving the crash
+# again on another unit takes one command.  Hiding itself now needs -f.
+#
+# Identity: `adb shell pm hide` fails with "Neither user 2000 nor current
+# process has android.permission.MANAGE_USERS".  n2-pm runs as uid 0 inside the
+# same chroot, so Android's Java permission check passes; only the SELinux
+# domain has to be swapped, which is what n2-pm's runcon does.
+
+usage() {
+    cat <<'USAGE'
+usage: n2-hide [-l] [-u <package>...] [-f] <package>...
+  -l, --list     list the packages that are currently hidden
+  -u, --unhide   unhide instead of hide (rollback, always allowed)
+  -f, --force    actually hide; without it this command only explains why hiding
+                 crashes system_server on this ROM (see the header)
+USAGE
+}
+
+RESTRICTIONS=/proc/1/root/data/system/users/0/package-restrictions.xml
+[ -r "$RESTRICTIONS" ] || RESTRICTIONS=/data/system/users/0/package-restrictions.xml
+
+case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -l|--list)
+        # hidden="true" only exists in the per-user restrictions file; a hidden
+        # package simply disappears from `pm list packages`, so that command
+        # cannot tell hidden from uninstalled.
+        if [ ! -r "$RESTRICTIONS" ]; then
+            echo "cannot read $RESTRICTIONS" >&2
+            exit 1
+        fi
+        tr '>' '\n' < "$RESTRICTIONS" \
+          | grep 'hidden="true"' \
+          | sed -e 's/.*name="//' -e 's/".*//'
+        exit 0
+        ;;
+    -u|--unhide)
+        shift
+        [ $# -gt 0 ] || { usage; exit 2; }
+        for p in "$@"; do
+            out=$(n2-pm pm unhide --user 0 "$p" 2>&1 | tr -d '\r')
+            printf '%-42s %s\n' "$p" "${out:-no output}"
+        done
+        exit 0
+        ;;
+    -f|--force)
+        FORCE=1
+        shift
+        ;;
+    ''|-)
+        usage
+        exit 2
+        ;;
+esac
+
+if [ "${1:-}" = "" ]; then
+    usage
+    exit 2
+fi
+
+for p in "$@"; do
+    # MIUI's SecurityManagerService looks this one up by name on every boot;
+    # missing, it throws every 6-8 s and the phone parks at the MI logo.
+    if [ "$p" = com.xiaomi.market ]; then
+        echo "REFUSED  $p  (boot-critical: SecurityManagerService looks it up by name)"
+        continue
+    fi
+    if [ "$FORCE" != 1 ] && [ "${N2_HIDE_FORCE:-0}" != 1 ]; then
+        echo "REFUSED  $p  (hiding crashes system_server at boot; pass -f to override)"
+        continue
+    fi
+    out=$(n2-pm pm hide --user 0 "$p" 2>&1 | tr -d '\r')
+    printf '%-42s %s\n' "$p" "${out:-no output}"
+done

@@ -1,0 +1,31 @@
+#!/bin/sh
+# n2-debloat-loc.sh -- correlate "did MIUI put it back?" with "where does its
+# APK live?".
+#
+# After two rounds, 15 of 20 uninstalled-for-user packages came back on the
+# next boot while 5 stayed gone.  That is a rule, not noise, and the most
+# likely rule is the priv-app split: /system/priv-app holds packages granted
+# privileged permissions, which MIUI treats as part of the platform.  If the
+# split explains every package, we can predict the outcome before touching a
+# phone instead of discovering it after a reboot.
+for p in \
+    com.miui.player com.miui.video com.miui.newhome com.miui.voiceassist \
+    com.sohu.inputmethod.sogou.xiaomi com.miui.daemon com.xiaomi.gamecenter \
+    com.xiaomi.gamecenter.sdk.service com.xiaomi.scanner com.miui.compass \
+    com.miui.screenrecorder com.miui.touchassistant com.xiaomi.vipaccount \
+    com.miui.smarttravel com.xiaomi.drivemode com.mi.health com.mi.dlabs.vr \
+    com.miui.bugreport com.android.browser com.miui.translationservice \
+    com.miui.userguide com.android.egg com.miui.hybrid.accessory \
+    com.miui.translation.xmcloud com.miui.translation.youdao \
+    com.miui.systemAdSolution com.miui.hybrid com.xiaomi.joyose \
+    com.miui.analytics com.miui.weather2
+do
+    path=$(n2-pm pm path "$p" 2>/dev/null | head -1 | sed 's/^package://')
+    case "$path" in
+        */priv-app/*) where=priv-app ;;
+        */app/*)      where=app ;;
+        '')           where=GONE ;;
+        *)            where=other ;;
+    esac
+    printf '%-40s %-9s %s\n' "$p" "$where" "$path"
+done
