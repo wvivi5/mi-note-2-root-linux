@@ -17,7 +17,11 @@ PATS='com.miui.systemAdSolution|com.miui.analytics|com.miui.hybrid|com.xiaomi.jo
 echo "=== resident debloat-target processes (RSS from /proc/<pid>/statm) ==="
 tot=0; n=0
 for d in /proc/[0-9]*; do
-    cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+    # Redirect stderr around the *whole* redirection: writing it as
+    # `tr ... < "$d/cmdline" 2>/dev/null` still lets the shell report
+    # "cannot open /proc/<pid>/cmdline" when a process dies mid-scan, because the
+    # input redirect is opened before stderr is moved.
+    cmd=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null )
     [ -z "$cmd" ] && continue
     echo "$cmd" | grep -qE "$PATS" || continue
     rss=$(awk '{print $2}' "$d/statm" 2>/dev/null)
@@ -27,7 +31,10 @@ for d in /proc/[0-9]*; do
     printf '  %8d kB  pid=%-6s %s\n' "$kb" "$(basename "$d")" "$(echo "$cmd" | cut -c1-70)"
 done
 printf '  -------------------------------------------\n'
-printf '  total: %d kB = %.1f MB across %d processes\n' "$tot" "$(echo "scale=1; $tot/1024" | bc)" "$n"
+# Integer maths on purpose: the rootfs has no `bc`, and a missing one used to
+# make this line print "= 0.0 MB" -- which reads like the debloat freed nothing.
+printf '  total: %d kB = %d.%d MB across %d processes\n' \
+    "$tot" "$((tot / 1024))" "$(( (tot % 1024) * 10 / 1024 ))" "$n"
 
 echo
 echo "=== whole phone ==="

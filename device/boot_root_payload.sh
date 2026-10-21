@@ -858,7 +858,8 @@ echo "=== root payload done $(date) ===" >> $LOG
 # documented "fix it over ssh when USB is dead" path purely theoretical -- and
 # it is exactly the machine that needed it.  They now live in
 # device/phone-tools/ and are re-installed on every boot so this cannot rot.
-# Keep this block in sync with device/phone-tools/ (it is generated from there).
+# Keep this block in sync with device/phone-tools/ -- edit the files there and
+# run device\sync-phone-tools.ps1, never patch the heredocs by hand.
 mkdir -p $R/usr/local/bin 2>>$LOG
 cat > $R/usr/local/bin/n2-pm <<'N2_N2_PM'
 #!/bin/sh
@@ -1004,12 +1005,16 @@ cat > $R/usr/local/bin/n2-health <<'N2_N2_HEALTH'
 # two sshd listeners, the frpc tunnel, whether system_server is crash-looping,
 # and the resident processes that the debloat was meant to remove.
 echo "=== boot ==="
-echo "  boot_completed=$(getprop sys.boot_completed)  uptime=$(cut -d' ' -f1 /proc/uptime)s"
+# getprop only exists in /system/bin, which is not on PATH inside the chroot, so
+# it has to go through n2-pm like everything else that talks to Android.
+echo "  boot_completed=$(n2-pm getprop sys.boot_completed)  uptime=$(cut -d' ' -f1 /proc/uptime)s"
 echo "  packages installed=$(n2-pm cmd package list packages | grep -c .)  disabled=$(n2-pm pm list packages -d | grep -c .)"
 echo
 echo "=== chain ==="
 echo "  sshd(8022/8023)=$(ps -A 2>/dev/null | grep -c '[s]shd')  frpc=$(pidof frpc | tr -d '\r')"
-echo "  listeners: $(grep -icE ':1F56|:1F57' /proc/net/tcp /proc/net/tcp6 2>/dev/null | paste -sd+ | bc)"
+# No `bc` in this rootfs, so the old `| paste -sd+ | bc` printed an empty
+# count.  One grep over both files gives the same number.
+echo "  listeners: $(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -icE ':1F56|:1F57')"
 echo
 echo "=== system_server stability (FATAL count in this boot) ==="
 n2-pm logcat -d -b all 2>/dev/null | grep -c 'FATAL EXCEPTION IN SYSTEM PROCESS' | sed 's/^/  fatal=/'
@@ -1051,7 +1056,11 @@ PATS='com.miui.systemAdSolution|com.miui.analytics|com.miui.hybrid|com.xiaomi.jo
 echo "=== resident debloat-target processes (RSS from /proc/<pid>/statm) ==="
 tot=0; n=0
 for d in /proc/[0-9]*; do
-    cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+    # Redirect stderr around the *whole* redirection: writing it as
+    # `tr ... < "$d/cmdline" 2>/dev/null` still lets the shell report
+    # "cannot open /proc/<pid>/cmdline" when a process dies mid-scan, because the
+    # input redirect is opened before stderr is moved.
+    cmd=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null )
     [ -z "$cmd" ] && continue
     echo "$cmd" | grep -qE "$PATS" || continue
     rss=$(awk '{print $2}' "$d/statm" 2>/dev/null)
@@ -1061,7 +1070,10 @@ for d in /proc/[0-9]*; do
     printf '  %8d kB  pid=%-6s %s\n' "$kb" "$(basename "$d")" "$(echo "$cmd" | cut -c1-70)"
 done
 printf '  -------------------------------------------\n'
-printf '  total: %d kB = %.1f MB across %d processes\n' "$tot" "$(echo "scale=1; $tot/1024" | bc)" "$n"
+# Integer maths on purpose: the rootfs has no `bc`, and a missing one used to
+# make this line print "= 0.0 MB" -- which reads like the debloat freed nothing.
+printf '  total: %d kB = %d.%d MB across %d processes\n' \
+    "$tot" "$((tot / 1024))" "$(( (tot % 1024) * 10 / 1024 ))" "$n"
 
 echo
 echo "=== whole phone ==="
