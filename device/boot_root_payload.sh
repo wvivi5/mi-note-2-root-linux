@@ -819,6 +819,114 @@ echo "--- listening (1F56=8022 linux, 1F57=8023 termux) ---" >> $LOG
 grep -iE ":1F56|:1F57" /proc/net/tcp >> $LOG 2>&1
 echo "=== root payload done $(date) ===" >> $LOG
 
+# --- 5c. frpc: reverse tunnel to your own frps (optional, supervised) ----------
+# Why a supervisor and not "start it once at boot":
+#   * frp >= 0.60 defaults to loginFailExit=true, so frpc EXITS when frps is
+#     unreachable or the token is wrong -- "launched once" would silently die.
+#   * MIUI's cleaner / the low-memory killer reap stray processes (that is
+#     exactly how n2rtcalarm died while its pid still answered kill -0).
+# So this is the same recipe as n2watch: one instance, oom_score_adj -1000,
+# restart with backoff (a typo must not become a connect storm every 5 s).
+# /etc/frp/frpc.toml ships as a template (serverAddr = "0.0.0.0"): until you
+# fill it in, the supervisor just waits instead of spawning a useless frpc.
+#   off switch:  touch /etc/frp/n2-frpc-off     (rm it again to re-enable)
+cat > $R/root/n2frpc <<'FRPC'
+#!/bin/sh
+# Supervisor for frpc, runs *inside* the chroot.  No .sh suffix on purpose: the
+# kernel sets comm to the script name, so pgrep -x n2frpc counts exactly these.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+echo -1000 > /proc/self/oom_score_adj 2>/dev/null
+FRP=/usr/local/bin/frpc
+CONF=/etc/frp/frpc.toml
+OFF=/etc/frp/n2-frpc-off
+LOG=/var/log/frpc.log
+[ -x "$FRP" ] || exit 0
+# Single instance: the payload may run several times per power-on (BOOT_COMPLETED
+# is re-sent on every system_server restart); a surplus copy exits at once.
+me=$$
+for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    [ "$pid" = "$me" ] && continue
+    if [ "$(cat $d/comm 2>/dev/null)" = n2frpc ]; then
+        echo "$(date) surplus frpc supervisor $me -> exiting" >> $LOG
+        exit 0
+    fi
+done
+say() { echo "$(date) $1" >> $LOG; }
+# frpc logs every failed login, so cap the log ourselves (no logrotate here).
+if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 524288 ]; then
+    tail -c 131072 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG"
+fi
+waiting=
+miss=0
+backoff=5
+while :; do
+    if [ -f "$OFF" ]; then
+        if pgrep -x frpc >/dev/null 2>&1; then
+            say "off switch $OFF -> stopping frpc"
+            pkill -x frpc 2>/dev/null
+        else
+            [ -n "$waiting" ] && say "off switch $OFF -> idle"
+        fi
+        waiting=off
+        sleep 60
+        continue
+    fi
+    server=$(sed -n 's/^[[:space:]]*serverAddr[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CONF" 2>/dev/null | head -1)
+    case "$server" in
+        ''|0.0.0.0|::)
+            if pgrep -x frpc >/dev/null 2>&1; then
+                say "serverAddr cleared -> stopping frpc"
+                pkill -x frpc 2>/dev/null
+            fi
+            if [ "$waiting" != yes ]; then
+                say "not configured (serverAddr=${server:-missing}) -> waiting, edit $CONF"
+                waiting=yes
+            fi
+            sleep 60
+            continue
+            ;;
+    esac
+    waiting=no
+    if ! pgrep -x frpc >/dev/null 2>&1; then
+        say "frpc not running -> starting (server=$server retry in ${backoff}s)"
+        setsid "$FRP" -c "$CONF" >> "$LOG" 2>&1 &
+        sleep 3
+        if pgrep -x frpc >/dev/null 2>&1; then
+            miss=0
+            backoff=5
+        else
+            miss=$((miss + 1))
+            if [ "$miss" -ge 4 ]; then backoff=60; else backoff=15; fi
+            say "frpc exited immediately (attempt $miss) -> not retrying for ${backoff}s"
+        fi
+    fi
+    sleep $backoff
+done
+FRPC
+chmod 755 $R/root/n2frpc 2>>$LOG
+rm -f $R/root/n2frpc.sh 2>>$LOG
+# Restart the supervisor (same kill-old pattern as n2watch above).  Skipped when
+# frpc was never installed -- most deployments must not pay for a stray loop.
+if [ -x $R/usr/local/bin/frpc ]; then
+    for d in /proc/[0-9]*; do
+        case $(cat $d/comm 2>/dev/null) in
+            n2frpc|n2frpc.sh) kill -9 ${d#/proc/} 2>/dev/null ;;
+        esac
+    done
+    sleep 1
+    setsid chroot $R /root/n2frpc </dev/null >>$LOG 2>&1 &
+    sleep 1
+    for d in /proc/[0-9]*; do
+        [ "$(cat $d/comm 2>/dev/null)" = n2frpc ] || continue
+        echo -1000 > /proc/${d#/proc/}/oom_score_adj 2>/dev/null
+        printf '  frpc-supervisor %s adj %s\n' "${d#/proc/}" "$(cat $d/oom_score_adj 2>/dev/null)" >> $LOG
+    done
+    echo "--- frpc supervisor up (comm=n2frpc, conf=/etc/frp/frpc.toml, switch=/etc/frp/n2-frpc-off) ---" >> $LOG
+else
+    echo "--- frpc not installed -> tunnel supervisor skipped (/usr/local/bin/frpc + /etc/frp/frpc.toml) ---" >> $LOG
+fi
+
 # --- 5d. USB role: host (OTG NIC) or peripheral (adb) -- decided automatically
 # Measured on this device (2026-10-18):
 #   * MIUI never puts the USB port into host mode by itself -- there is no OTG

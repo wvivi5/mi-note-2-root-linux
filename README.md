@@ -112,7 +112,7 @@ device/                       部署与运维脚本（PowerShell + 手机侧 sh�
   flash_edl.ps1               EDL(9008) 深刷统一开发版（无需解 BL）
   make-package.ps1            打出离线开箱包（含 adb/APK/rootfs）
   *.bat                       双击启动器
-  boot_root_payload.sh        设备上的 root 载荷（密码、sshd、看门狗、oom、日志外带）
+  boot_root_payload.sh        设备上的 root 载荷（密码、sshd、RTC 守护、frpc 守护、看门狗、oom、日志外带）
   udocker-setup.sh            在 Linux 里一键装 udocker（跑 Docker 镜像，见 DOCKER_VERDICT.md）
   n2wifi                      纯 ssh 管理 Android 侧 WiFi（list/status/scan/ip/join/add/del/apply/backups/revert）
   push-wifi-tool.ps1          把 n2wifi 推到单台 / 整个网段

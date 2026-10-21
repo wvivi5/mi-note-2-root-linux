@@ -784,4 +784,58 @@ n2wifi join "SiteA-5G"   "passwordA"
 - 该机型的 `wpa_supplicant` 控制口（`/data/misc/wifi/sockets/wlan0`、`/dev/socket/wpa_wlan0`）**收包但从不回包**（`wpa_cli`、裸 socket 全超时，权限已排除），所以不要指望 `wpa_cli` 那条路。
 - 本机 Android 8 没有 `cmd wifi`（`cmd -l` 无 wifi 服务），也没有 `wpa_cli`、没有 `WifiManager` shell 接口 —— 改配置存储是唯一不碰屏幕的路。
 
+## 11. frpc 反向隧道：不在同一网段也能 ssh 进来
+
+路由器跨网段、AP 客户端隔离、或者人根本不在现场时的后手：手机上的 `frpc` **主动**连你自己那台
+公网 `frps`，把 chroot 的 8022 反向顶出去 —— 于是任何地方都是
+`ssh -p <remotePort> root@<frps 公网IP>`，不依赖现场局域网、不依赖对方路由器给你端口转发。
+
+### 11.1 装法（已在 `4bbc97a9` 实测 0.71.1 全链路）
+
+| 东西 | 路径 | 怎么来的 |
+|---|---|---|
+| 客户端 | `/usr/local/bin/frpc` | GitHub 官方 release `frp_0.71.1_linux_arm64.tar.gz` → 对官方 `frp_sha256_checksums.txt` 校验 → `scp` 进 8022 → `install -m755` |
+| 客户端配置 | `/etc/frp/frpc.toml`（模板，权限 `600`） | 填 `serverAddr` / `auth.token` / `remotePort` 三处 |
+| 服务端模板 | `/etc/frp/frps.toml` | 放到你有公网 IP 的机器上跑，手机上用不到 |
+| 守护 | `/root/n2frpc`（载荷 §5c 每次开机重建） | 见 11.2 |
+
+不用 apt（Ubuntu 22.04 源里没有 frp），不用 go build（没必要交叉编译）。chroot 里虽然有
+`wget`/`curl` 理论上能直连 GitHub，但国内不稳 —— **PC 下载 + scp** 是可靠路径。
+
+### 11.2 开机自启（载荷 §5c，配方抄的 n2watch）
+
+`frp >= 0.60` 默认 `loginFailExit=true`：**frps 连不上 / token 错，frpc 会自己退出**，
+所以"开机起一次"必然静默失效 —— 必须有守护。守护 `n2frpc` 的行为全部实测过：
+
+| 情况 | 行为 | 实测 |
+|---|---|---|
+| 配置还是模板（`serverAddr = 0.0.0.0`） | **只等待，不拉起无用进程**，60 秒轮询一次 | `not configured ... -> waiting` |
+| 把配置填好 | ≤60 秒自动拉起 frpc | **38 秒**：`login to server success` → `start proxy success` |
+| frps 挂了 / token 错 | frpc 退出后按 `5s → 15s → 60s` 退避重启，不产生连接风暴 | — |
+| 配置改回模板 | 自动把 frpc 停掉 | **8 秒** |
+| 载荷重复跑（`BOOT_COMPLETED` 重发） | 单实例：多余的守护立刻自己退出 | 同 n2watch 的 surplus 逻辑 |
+| 被 MIUI / LMK 清掉 | `oom_score_adj = -1000`；真被杀了，下一轮轮询拉回 | — |
+
+- 关掉：`touch /etc/frp/n2-frpc-off`；重新开：`rm /etc/frp/n2-frpc-off`
+- 改配置**不用重启**，最多 60 秒生效
+- 日志：`/var/log/frpc.log`（frpc 自己的输出 + 守护的决策行，>512KB 自动截尾）
+
+### 11.3 三个坑
+
+1. **`localPort` 要填 `8022`，不是 `22`** —— chroot 不是独立 netns，sshd 直接监听 8022
+   （`ss -lnt` 实测）；按常识写 22 会得到一条连不上的隧道。
+2. **frp ≥ 0.52 是 TOML**（`frpc.toml`），老教程里的 `frpc.ini` 写法不认。
+3. **chroot 里没有 systemd**，`systemctl` 不存在；自启靠的是载荷里的守护，不是 unit 文件。
+
+### 11.4 怎么看它健不健康
+
+```sh
+pgrep -x n2frpc                        # 守护在不在（应有 1 个）
+tail -20 /var/log/frpc.log             # waiting = 还没填配置；login success = 通了
+pgrep -x frpc                          # 配置填了才该有进程
+grep -m1 serverAddr /etc/frp/frpc.toml # 确认不是 0.0.0.0
+```
+
+外面验收：`ssh -p <remotePort> root@<frps 公网IP>` 直接登进 chroot（密码 `147147` 或密钥）。
+
 
