@@ -40,6 +40,18 @@ function Resolve-Adb {
     foreach ($d in @($PSScriptRoot, (Split-Path $PSScriptRoot -Parent), (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent))) {
         if ($d) { $c = Join-Path $d 'tools\platform-tools\adb.exe'; if (Test-Path $c) { return (Resolve-Path $c).Path } }
     }
+    # ASCII-only scan of the top two levels of each drive.  Written without any
+    # non-ASCII literal on purpose: a .ps1 with no UTF-8 BOM is decoded using the
+    # ANSI codepage, so a path containing such characters no longer matches the
+    # file on disk and every invocation dies with CommandNotFound.
+    foreach ($drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue).Root) {
+        $c = Join-Path $drive 'tools\platform-tools\adb.exe'
+        if (Test-Path -LiteralPath $c) { return $c }
+        foreach ($sub in @(Get-ChildItem $drive -Directory -ErrorAction SilentlyContinue)) {
+            $c = Join-Path $sub.FullName 'tools\platform-tools\adb.exe'
+            if (Test-Path -LiteralPath $c) { return $c }
+        }
+    }
     $w = Get-Command adb.exe -ErrorAction SilentlyContinue
     if ($w) { return $w.Source }
     throw 'adb.exe not found; pass -Adb <path>'

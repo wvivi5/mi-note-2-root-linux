@@ -616,6 +616,7 @@ strings /proc/last_kmsg | grep -a Power-on      # 上一次开机（关机后仍
 | 8022 起不来，`/data/local/tmp/boot.log` 里有 `kernel guard` 字样 | 这台机器的内核/ROM 与 exploit 地址表不匹配，守卫**故意**跳过了 root 链（避免无限重启）。先 `collect-info.ps1` 确认，再决定是否重算偏移或 `-ForceKernel` |
 | 改了载荷但不想重启 | `.\device\rerun.ps1 -Serial <SN>` |
 | `pgrep -x n2watch \| wc -l` 不是 2（4/6/8 个） | 2026-10-20 之前的载荷在「框架重启 → BOOT_COMPLETED 重发 → 开机链重跑」时会叠加。已修（单实例锁 + 计数起 + 看门狗自限，见 §6）；跑一次 `rerun.ps1` 让新载荷把这些多余的收掉 |
+| **8022 掉了，`rerun.ps1` 也"成功"了，但载荷根本没跑（boot.log 时间戳不变）** | 载荷的单实例锁被**时钟倒流**毒死。锁目录 `/data/local/tmp/n2-payload.lock/ts` 里存的是上次运行的时间戳；如果那个戳被写在"未来"，`NOW - LOCKT0` 就是**负数**，而旧判断写的是 `[ age -lt 120 ]` —— 负数恒小于 120，于是每次运行都判定"别人正拿着锁"直接静默退出。`boot.log` 里的铁证：`payload skipped: another run holds the lock (age -100700s)`。**时钟为什么会倒流**：拆电池改直供电会让 RTC 归零（`since_epoch` 回到 3601 这种值），之后又被 NTP / Android 持久化的墙上时钟拉回来，一前一后正好造成"锁在未来"。已根治（2026-10-21）：只有 `age ∈ [0,120)` 才算"有人正在跑"，负数和超龄一样按**僵尸锁接管**。老机器遇到时先 `adb shell rm -rf /data/local/tmp/n2-payload.lock`，再跑 `rerun.ps1` |
 | **关机后不自己开机**（第一次行、第二次以后不行） | 2026-10-20 已定位两个根因并修好：① 系统"关机"流程会在断电前几秒把 RTC 闹钟清掉（`alrm_time` 变 `00:00:00`）；② 守护可能"pid 还在但不干活"。现在守护**独占** `/dev/rtc0`（别人 `open()` 直接 `EBUSY`），看门狗只认寄存器。细节见 §6 |
 | 关机前想确认"这次一定能自启" | 手机里 `grep alrm_time /proc/driver/rtc`：有未来时刻=有唤醒源；`00:00:00`=关机必死。再 `grep -e "keeper blind" -e LOST /var/log/n2rtc.log \| tail` 看有没有异常 |
 | 日志里出现 `keeper blind ... state=Z/D` | 看门狗判定守护失效并已重拉。`state=Z`=僵尸（被杀但父进程没回收）、`state=D`=卡在 IO。偶尔一次属自愈；**连续出现**说明有东西在反复杀它，把这段日志发我 |
@@ -854,5 +855,51 @@ grep -m1 serverAddr /etc/frp/frpc.toml # 确认不是 0.0.0.0
 ```
 
 外面验收：`ssh -p <remotePort> root@<frps 公网IP>` 直接登进 chroot（密码 `147147` 或密钥）。
+
+### 11.5 每台机器的命名表（隧道名 / 端口必须全局唯一）
+
+| 机器 | 序列号 | 隧道名 `name` | `remotePort` | 验收 |
+|---|---|---|---|---|
+| A | `4bbc97a9` | `note2ssh128` | `11221` | `ssh -p 11221 root@168.138.171.141` |
+| B | `85126a4c` | `note2ssh0` | `11220` | `ssh -p 11220 root@168.138.171.141` |
+
+`name` 和 `remotePort` 在 frps 上都是**全局唯一**的。两台填成一样，后连上来的会被 frps 拒绝并把先来的踢掉，表现为"隧道一会儿通一会儿不通"，非常难查 —— 所以每装一台先来这张表里占一行。
+
+```toml
+# 本机(85126a4c)：ssh -p 11220 root@168.138.171.141
+[[proxies]]
+name = "note2ssh0"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8022
+remotePort = 11220
+loginFailExit = false     # 无 WiFi 靠 USB 网卡的机器建议加：拔插网卡时别退出，自己重连
+```
+
+### 11.6 交叉预检：还没有网络的机器也能先验证配置
+
+新机器往往只有 adb、没有网（USB 网卡没插）。这时配置对不对是**未知**的，最坏的情况是等网卡插上才发现 token 错或端口被占。
+
+办法：**拿新机器的 `frpc.toml` 到一台已经有网的机器上跑 14 秒**。
+
+```sh
+scp frpc-b.toml root@A:/tmp/frpc-test.toml
+ssh root@A 'timeout 14 /usr/local/bin/frpc -c /tmp/frpc-test.toml'
+# 期望三行（2026-10-21 对 85126a4c 的配置实测通过）：
+#   login to server success, get run id [...]
+#   proxy added: [note2ssh0]
+#   [note2ssh0] start proxy success
+```
+
+出现 `start proxy success` 就说明 **token、隧道名、remotePort 三样在 frps 侧都可用**；之后新机器一旦有网就会自己连上。缺任何一行就别急着插网卡。
+
+**坑：Windows Defender 会在几分钟内删掉 PC 上的 frpc**（隧道工具命中启发式，表现是 scp 下来明明有 15 MB、过一会 `Test-Path` 变 False）。所以别让这个二进制在 PC 上落地，用 cmd 的原始字节管道直接对拷：
+
+```bat
+ssh ... root@A "cat /usr/local/bin/frpc" | ssh ... root@B "cat > /usr/local/bin/frpc && chmod 755 /usr/local/bin/frpc"
+```
+
+必须走 `cmd /c`（或 .bat）：**cmd 的管道是原始字节，PowerShell 的管道会把二进制当文本编码一遍直接弄坏**。
+
 
 

@@ -57,12 +57,30 @@ if mkdir "$LOCKDIR" 2>/dev/null; then
 else
     LOCKT0=$(tr -dc 0-9 < "$LOCKDIR/ts" 2>/dev/null)
     NOW=$(date +%s)
-    if [ -n "$LOCKT0" ] && [ $((NOW - LOCKT0)) -lt 120 ]; then
-        echo "=== payload skipped: another run holds the lock (age $((NOW - LOCKT0))s) ===" >> $LOG
+    # Only a lock whose age falls inside [0, 120) can mean "someone is running
+    # right now".  A NEGATIVE age is not a fresh lock, it is the wall clock
+    # moving backwards -- which happens for real on this fleet: pulling the
+    # battery to convert a unit to direct power resets the RTC to 1970, and the
+    # clock is then dragged forward again by NTP or Android's persisted wall
+    # clock, so a lock written minutes ago can sit in the future relative to
+    # the clock reading it against.  The old test was `[ age -lt 120 ]` and a
+    # negative age satisfies it, so the payload took its own stale lock to be
+    # alive and exited silently.  On 2026-10-21 (device 85126a4c) that stranded
+    # the unit completely: sshd had died, every re-trigger did nothing, and the
+    # only trace was "payload skipped: another run holds the lock (age
+    # -100700s)".  Anything outside [0, 120) is stale -- take it over.
+    AGE=-1
+    case "$LOCKT0" in
+        ''|*[!0-9]*) LOCKT0= ;;
+        *) AGE=$((NOW - LOCKT0)) ;;
+    esac
+    if [ -n "$LOCKT0" ] && [ "$AGE" -ge 0 ] && [ "$AGE" -lt 120 ]; then
+        echo "=== payload skipped: another run holds the lock (age ${AGE}s) ===" >> $LOG
         exit 0
     fi
-    # stale lock: a previous run was SIGKILLed before its trap could clean up
-    echo "=== taking over a stale payload lock ===" >> $LOG
+    # stale lock: a previous run was SIGKILLed before its trap could clean up,
+    # or the clock went backwards underneath it.
+    echo "=== taking over a stale payload lock (age ${AGE}s) ===" >> $LOG
     rm -rf "$LOCKDIR"
     mkdir "$LOCKDIR" 2>/dev/null && date +%s > "$LOCKDIR/ts" 2>/dev/null
     trap 'rm -rf "$LOCKDIR"' EXIT

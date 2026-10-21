@@ -36,7 +36,8 @@ param(
     [int]$Batch = 0,
     [switch]$All,
     [switch]$Check,
-    [switch]$NoReboot
+    [switch]$NoReboot,
+    [switch]$IncludeRestores
 )
 $ErrorActionPreference = 'Continue'
 
@@ -86,8 +87,10 @@ $Forbidden = @('com.xiaomi.market')
 # batches (30 packages tried, 13 held, 17 returned).  The split does not follow
 # priv-app vs app, and it is not derivable from the dex references either -
 # services.vdex mentions 25 of the 30, so a static screen cannot predict it.
-# Listed here so the next machine can skip the wasted cycles; the script still
-# re-checks after every batch, because the list could differ per ROM.
+# Invoke-Batch consults this list and skips these unless -IncludeRestores is
+# passed, so a new machine only pays for the batches that actually change
+# something.  The post-batch check still names anything that comes back, so a
+# ROM whose behaviour differs is reported instead of silently assumed.
 $MiuiRestores = @(
     'com.miui.player', 'com.miui.video', 'com.miui.newhome', 'com.miui.voiceassist',
     'com.sohu.inputmethod.sogou.xiaomi', 'com.miui.daemon', 'com.xiaomi.gamecenter',
@@ -166,6 +169,20 @@ function Invoke-Batch([string[]]$Pkgs, [string]$Tag) {
     $clean = @($Pkgs | Where-Object { $Forbidden -notcontains $_ })
     if ($clean.Count -ne $Pkgs.Count) {
         Warn "refusing forbidden package(s): $(@($Pkgs | Where-Object { $Forbidden -contains $_ }) -join ', ')"
+    }
+    # Skip the packages MIUI re-installs on the very next boot unless the caller
+    # insists.  Until 2026-10-21 $MiuiRestores was documentation only -- it was
+    # declared but never read, so the second machine (85126a4c) would have spent
+    # three extra reboot cycles re-proving that 17 of the 30 candidates come
+    # straight back.  A reboot is the expensive and risky step here (each one is
+    # a chance to land on the FDE screen), so paying it for a known no-op is
+    # exactly the kind of wasted cycle this rig exists to avoid.
+    if (-not $IncludeRestores) {
+        $skip = @($clean | Where-Object { $MiuiRestores -contains $_ })
+        if ($skip.Count -gt 0) {
+            Say "skipping $($skip.Count) package(s) MIUI is known to re-install: $($skip -join ', ')"
+            $clean = @($clean | Where-Object { $MiuiRestores -notcontains $_ })
+        }
     }
     if ($clean.Count -eq 0) { return $true }
     $before = Get-Count
