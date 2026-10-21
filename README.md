@@ -10,6 +10,20 @@ ssh -p 8022 root@<手机IP>      # 密码 147147 或密钥
 一台 2017 年的老机器，锁着 BL，只靠一个内核漏洞 + Termux:Boot，就变成了一个能远程
 ssh 进去的 Linux 小盒子 —— 这就是这个仓库的全部内容。
 
+## 现状（2026-10-21）
+
+| 能力 | 状态 |
+|---|---|
+| 免解锁 root + Ubuntu chroot + 8022 ssh（密钥/密码） | ✅ 机队实测 |
+| 重启 / 断电后自动恢复（Termux:Boot → root 链 → sshd） | ✅ |
+| **关机后靠 PMIC RTC 闹钟自己开机** | ✅ 端到端实测 6 次：系统关机（插线/纯电池/冷启动）、插 500 mA 电脑 USB 口，全部自动回到 ssh |
+| 守护「pid 还在但不干活」 | ✅ 已根治：守护**独占** `/dev/rtc0`（别人 `open()` 直接 `EBUSY`）+ 看门狗只认寄存器（`alrm-now` 必须落在 1 秒~15 分钟），连续 2 次不符就杀掉重拉 |
+| 不开屏换 WiFi | ✅ `n2wifi`（已单独开源：[wvivi5/n2wifi](https://github.com/wvivi5/n2wifi)） |
+| 闹钟叫醒后停在「充电界面」 | ⚠️ **供电问题，不是软件问题**：LK 判断电压不足会把启动降级成充电模式，此时 Android 和 chroot 都**没起来**，软件层无法干预、也不会自动重试。只能换电池 / 2 A 以上供电 / 加 UPS。详见 [`device/README.md` §6](device/README.md) |
+
+剩下的事：换过电池的机器再复测一轮「充满 → 拔线 → 关机 → 等闹钟」；其余机器各跑一次
+`5-rerun.bat` 升级到最新载荷。
+
 ---
 
 ## 它是怎么工作的
@@ -20,7 +34,7 @@ ssh 进去的 Linux 小盒子 —— 这就是这个仓库的全部内容。
 | 落地 | 改 `modprobe_path` 指向 helper → 内核 UMH 以 **root** 执行它 | 不依赖任何已安装的 root 工具 |
 | 关 SELinux | 写 `selinux_enforcing` = 0 | 之后 root 载荷才跑得动 |
 | 持久化 | **Termux:Boot** 的 `~/.termux/boot/00-startup.sh`（开机自动执行） | App 身份，不碰任何验签分区 |
-| 通电自启 | **PMIC RTC 闹钟**（`/dev/rtc0` + `RTC_WKALM_SET`）：把**已关机**的手机开机回来；按 RTC 自身 24h 时钟**每 5 分钟**（默认 `step=300` 秒，`:00 :05 :10 …`）轮询，**不看日期** | 锁 BL 的 LK 无视 `oem off-mode-charge`，但 PMIC 闹钟照样能开机 |
+| 通电自启 | **PMIC RTC 闹钟**（`/dev/rtc0` + `RTC_WKALM_SET`）：把**已关机**的手机开机回来；按 RTC 自身 24h 时钟**每 5 分钟**（默认 `step=300` 秒，`:00 :05 :10 …`）轮询，**不看日期**；常驻守护独占 RTC、看门狗只认寄存器 | 锁 BL 的 LK 无视 `oem off-mode-charge`，但 PMIC 闹钟照样能开机。**已端到端实测 6 次**（含冷启动、纯电池、插 500mA 电脑口） |
 | Linux | Ubuntu 22.04 rootfs + `chroot`，chroot 内起 sshd | 不用容器、不用内核模块 |
 | 抗杀后台 | sshd / 看门狗 `oom_score_adj=-1000` + chroot 内 2 个互为备份的看门狗 | MIUI 会杀后台，看门狗 15 秒自愈 |
 | 防砖 | 开机链**先比内核**（`uname -r`），不匹配就整条不跑 | exploit 地址写死，换内核会 panic 无限重启 |
@@ -56,6 +70,9 @@ n2wifi join "SiteA-5G" "password"            # 存进去并让 Android 立刻重
 所以**重启后依然有效**；而且"加网络"不会把你从当前 WiFi 上踢下来 ——
 新网络只有在信号范围内才会被自动选中，可以提前把现场所有路由器都存进去。
 详见 [`device/README.md` §10](device/README.md)。
+
+`n2wifi` 已单独开源（中英文 README、安装脚本、release）：
+<https://github.com/wvivi5/n2wifi>
 
 ---
 
@@ -97,7 +114,7 @@ device/                       部署与运维脚本（PowerShell + 手机侧 sh�
   *.bat                       双击启动器
   boot_root_payload.sh        设备上的 root 载荷（密码、sshd、看门狗、oom、日志外带）
   udocker-setup.sh            在 Linux 里一键装 udocker（跑 Docker 镜像，见 DOCKER_VERDICT.md）
-  n2wifi                      纯 ssh 管理 Android 侧 WiFi（list/status/join/add/del/apply）
+  n2wifi                      纯 ssh 管理 Android 侧 WiFi（list/status/scan/ip/join/add/del/apply/backups/revert）
   push-wifi-tool.ps1          把 n2wifi 推到单台 / 整个网段
   00-startup.sh               开机钩子（内核守卫、Termux:Boot 入口）
   p1.sh / p2.sh / p2wrap.sh   部署期 stage-1 / stage-2 / root 包装
