@@ -171,6 +171,7 @@ for p in $(pgrep -x sshd); do cat /proc/$p/oom_score_adj; done   # 正常都是 
 | `restore-debloat.ps1` / `.bat` | PC | 精简的一键撤销：42 个包全部 `cmd package install-existing` + 包数回查（卡 MI logo 时用它） |
 | `fde-watchdog.ps1` / `.bat` | PC | **常驻在现场 PC 上跑**：每 30 秒查 USB 上的手机，哪台 `vold.decrypt` 卡在 `trigger_restart_min_framework`（停电后偶发的解密失败）超过 90 秒就给一次**热重启**（热重启必成，冷启动才会撞上 TZ 竞争）。带频率限制：每台每小时最多 3 次，超过只报警不再重启（说明是电池/充电器问题，不是竞争）。加 `-LanFile fleet.txt` 还会**盯局域网上的机器**：超过 `-DarkMinutes`（默认 15 分钟）没在 8022 上应答就报警 —— 这一类 adb 救不了（机器根本没开机），只能靠人按电源键，看门狗的价值是**替人发现**。见 §7 |
 | `fleet.txt` | PC | 机队 IP 清单（一行一个，`#` 开头为注释），喂给 `fde-watchdog.ps1 -LanFile` |
+| `fde-test.ps1` / `.bat` | PC | **只在测试机上跑**：反复"关机（不是重启）→ 等 RTC 闹钟叫醒 → 记录解密结果"到 `results.csv`，用来统计冷启动解密失败率；每次失败自动抓 logcat/dmesg/getprop 再 `adb reboot` 恢复 |
 | `n2-pm` | **root**（chroot，装在手机 `/usr/local/bin`） | 在 chroot 里以 `u:r:shell:s0` 身份调 Android 的 pm/cmd —— 我们的 sshd 是 `kernel` 域会被 servicemanager 拒绝，而 adb 能用正是因为它跑在 `shell` 域。USB/adb 挂掉时全靠它（见 §7） |
 | `n2-debloat-apply` / `n2-debloat-state` | **root**（chroot） | 没有 adb 时的精简/验收：`n2-debloat-apply <包名...>` 卸载并回查；`n2-debloat-state` 逐个报 installed/disabled |
 | `n2-health` / `n2-mem` | **root**（chroot） | 机况自检：开机状态、8022/8023/frpc、system_server 崩溃计数；内存用 `/proc` 直读（`dumpsys meminfo` 经 runcon 会超时、`ps -o` 在 chroot 里不输出，都别用） |
