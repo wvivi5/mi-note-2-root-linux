@@ -54,6 +54,21 @@ function Resolve-Adb {
             $d = Split-Path $d -Parent
         }
     }
+    # Last resort: scan the top two levels of every drive for
+    # tools\platform-tools\adb.exe.  This walk is ASCII-only on purpose.  A
+    # literal path containing non-ASCII characters in a .ps1 without a UTF-8 BOM
+    # is decoded with the ANSI codepage (936 here), so the string no longer
+    # points at a real file - Test-Path returns False and every invocation dies
+    # with CommandNotFound.  That is exactly how the first version of the test
+    # rig failed to reach adb at all while the file sat on disk.
+    foreach ($drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue).Root) {
+        $c = Join-Path $drive 'tools\platform-tools\adb.exe'
+        if (Test-Path -LiteralPath $c) { return $c }
+        foreach ($sub in @(Get-ChildItem $drive -Directory -ErrorAction SilentlyContinue)) {
+            $c = Join-Path $sub.FullName 'tools\platform-tools\adb.exe'
+            if (Test-Path -LiteralPath $c) { return $c }
+        }
+    }
     $w = Get-Command adb.exe -ErrorAction SilentlyContinue
     if ($w) { return $w.Source }
     throw 'adb.exe not found; pass -Adb <path>'
