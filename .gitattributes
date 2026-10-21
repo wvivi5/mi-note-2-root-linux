@@ -10,6 +10,10 @@
 
 # Shell scripts that get run by the kernel / init without a matching extension.
 device/mp_p1  text eol=lf
+# Helper scripts installed into the chroot's /usr/local/bin by payload section 5e.
+# They have no extension, so without this rule core.autocrlf=true checks them out
+# as CRLF and /bin/sh refuses the shebang on a fresh clone.
+device/phone-tools/*  text eol=lf
 # Python tool pushed into the chroot and executed via its shebang.
 device/n2wifi  text eol=lf
 
