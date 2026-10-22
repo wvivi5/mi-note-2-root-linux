@@ -875,6 +875,13 @@ cat > $R/usr/local/bin/n2-pm <<'N2_N2_PM'
 # so it works as-is) while `cmd` is an ELF binary - exec the target directly
 # rather than forcing it through sh, which would try to parse ELF as a script.
 R=/proc/1/root
+# Set PATH unconditionally: this script is called both from an interactive chroot
+# ssh session (sane PATH) and from the boot payload, which exports the *Android*
+# PATH ($P/bin:/system/bin:/system/xbin).  In the latter case `exec chroot` fails
+# with "chroot: not found" and every tool built on n2-pm silently produces
+# nothing -- which is exactly what happened to the boot logdump on 2026-10-21.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 exec chroot $R /system/bin/env \
     PATH=/system/bin \
     ANDROID_ROOT=/system \
@@ -1203,6 +1210,31 @@ chmod 755 $R/usr/local/bin/n2-hide 2>>$LOG
 
 # --- end 5e ---------------------------------------------------------------
 
+# --- 5f. boot forensics: snapshot logd on every payload run -------------------
+# Why: when a machine parks at the MI logo there is no way in -- the USB port is
+# in host mode driving the network adapter, so adb is gone, and a machine with
+# no working WiFi has no other door.  On 2026-10-21 that happened to 85126a4c
+# and the only reason the cause (WifiAssistant not initialized, see below) could
+# be identified at all was that system_server had written six crash records to
+# /data/system/dropbox before it died.
+#
+# logd is a separate process and keeps its ring buffers across system_server
+# restarts, so a `logcat -d` snapshot taken the moment the payload gets to run
+# still contains whatever killed the previous system_server.  The payload runs
+# on every BOOT_COMPLETED, which during a crash loop means "again and again", so
+# this costs nothing when things are healthy and pays for itself when they are
+# not.  /data/local/tmp survives reboots; keep the last three snapshots.
+N2DUMP=/data/local/tmp/n2-logdump
+mkdir -p $N2DUMP 2>>$LOG
+# Go through n2-pm, not bare /system/bin/logcat: this script is uid 0 but lives
+# in u:r:kernel:s0, and that domain is not allowed to read the logd buffers.
+# The /usr/bin/env -i is not decoration: without it the payload's Android PATH
+# leaks into the chroot and n2-pm dies with "chroot: not found".
+chroot $R /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    /usr/local/bin/n2-pm logcat -d -b all -v time > $N2DUMP/boot-$(date +%H%M%S).log 2>>$LOG
+ls -1t $N2DUMP/boot-*.log 2>/dev/null | tail -n +4 | while read -r f; do rm -f "$f"; done
+echo "--- logdump: $(ls -1 $N2DUMP/boot-*.log 2>/dev/null | wc -l) snapshot(s), newest $(ls -1t $N2DUMP/boot-*.log 2>/dev/null | head -1) ---" >> $LOG
+
 # --- 5c. frpc: reverse tunnel to your own frps (optional, supervised) ----------
 # Why a supervisor and not "start it once at boot":
 #   * frp >= 0.60 defaults to loginFailExit=true, so frpc EXITS when frps is
@@ -1337,6 +1369,9 @@ fi
 #     hub (usb/type=USB_DCP, current_max=1.5A, battery Full).
 # Manual overrides (first match wins, and they beat the automatic rules):
 #   /data/local/tmp/n2-host   (host)      /data/local/tmp/n2-nohost (peripheral)
+#   /data/local/tmp/n2-usb-pref-host  -> this machine boots (and stays) host,
+#       because its permanent network is a USB NIC on the OTG port; only a
+#       computer port (USB_SDP) or a host driving our gadget flips it back.
 #   $HOME/n2/usbmode containing "host" or "peripheral"   <- Termux, needs no net
 USBKNOB=/sys/devices/soc/6a00000.ssusb/mode
 if [ -e $USBKNOB ]; then
@@ -1363,13 +1398,12 @@ M=/sys/devices/soc/6a00000.ssusb/mode
 LOG=/data/local/tmp/n2-usbnet.log
 FLAG_HOST=/data/local/tmp/n2-host
 FLAG_PERI=/data/local/tmp/n2-nohost
+FLAG_PREF_HOST=/data/local/tmp/n2-usb-pref-host
 TMODE=/data/data/com.termux/files/home/n2/usbmode
 CHGT=/sys/class/power_supply/usb/type
 CHGO=/sys/class/power_supply/usb/online
 UDC=/sys/class/udc
 IFACE=eth0
-FALLBACK_IP=192.168.68.61
-GW=192.168.68.1
 HOLD=30
 log() { echo "[$(date '+%m-%d %H:%M:%S')] $*" >> $LOG; }
 # is a device attached to us? (only meaningful while we are host; the root hubs
@@ -1401,6 +1435,16 @@ decide() {
         host)       echo "host termux-override"; return ;;
         peripheral) echo "peripheral termux-override"; return ;;
     esac
+    # pref-host machine (see FLAG_PREF_HOST above): this box's only network is a
+    # USB NIC that stays plugged in for good.  Never drop to peripheral just
+    # because the NIC is not enumerated yet -- e.g. it is powered up 60 s late by
+    # a delay relay, so at payload time the port is host with no device on it.
+    # Only a real computer port (SDP) or a host actually driving our gadget may
+    # take the port away, so adb still works when the cable goes to a PC.
+    if [ -e $FLAG_PREF_HOST ]; then
+        have_host && { echo "peripheral host-driving"; return; }
+        echo "host pref-host"; return
+    fi
     case $ctype in
         USB_CDP|USB_SDP) echo "peripheral computer-port"; return ;;
     esac
@@ -1472,11 +1516,14 @@ while : ; do
         else
             idle=$((idle + 1))
             if [ $idle -eq 20 ]; then
-                log "eth0 has no address after 20s -> static $FALLBACK_IP/24"
-                ip link set $IFACE up >>$LOG 2>&1
-                ip addr add $FALLBACK_IP/24 dev $IFACE >>$LOG 2>&1
-                ip route add default via $GW dev $IFACE >>$LOG 2>&1
-                log "eth0: $(ip -4 addr show $IFACE 2>/dev/null | grep inet)"
+                # Deliberately do NOT assign a static address here any more: the
+                # phone must work on whatever router is on site, and a hardcoded
+                # IP/subnet (or a hardcoded gateway) is wrong on any other LAN.
+                # Address, gateway and DNS now come from the router's DHCP; if
+                # there is still nothing after 20 s, DHCP failed or is slow and
+                # the only useful thing we can do is say so.
+                log "eth0 has no IPv4 after 20s (Android DHCP pending/failed; not forcing a static address)"
+                idle=0
             fi
         fi
     else

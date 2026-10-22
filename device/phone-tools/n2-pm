@@ -11,6 +11,13 @@
 # so it works as-is) while `cmd` is an ELF binary - exec the target directly
 # rather than forcing it through sh, which would try to parse ELF as a script.
 R=/proc/1/root
+# Set PATH unconditionally: this script is called both from an interactive chroot
+# ssh session (sane PATH) and from the boot payload, which exports the *Android*
+# PATH ($P/bin:/system/bin:/system/xbin).  In the latter case `exec chroot` fails
+# with "chroot: not found" and every tool built on n2-pm silently produces
+# nothing -- which is exactly what happened to the boot logdump on 2026-10-21.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 exec chroot $R /system/bin/env \
     PATH=/system/bin \
     ANDROID_ROOT=/system \

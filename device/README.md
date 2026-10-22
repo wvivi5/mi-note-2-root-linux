@@ -285,8 +285,68 @@ for p in $(pgrep -x sshd); do cat /proc/$p/oom_score_adj; done   # 正常都是 
 
 **实现位置**：`boot_root_payload.sh` 的 §5d 段落会（1）按上面的优先级判定目标角色，
 （2）把常驻脚本写到 `/data/local/tmp/n2-usbnet.sh` 并拉起，日志 `/data/local/tmp/n2-usbnet.log`。
-常驻脚本只干两件事：**每 1 秒读一次 knob，只有和目标不一致时才写**（避免反复切换把总线抖死）；
-以及万一某个 ROM 没有以太网服务，`eth0` 20 秒还拿不到地址就兜底配静态 `192.168.68.61/24`。
+常驻脚本每 1 秒读一次 knob，只有和目标不一致时才写（避免反复切换把总线抖死）；
+`eth0` 20 秒还拿不到 IPv4 时**只记一条日志，不再兜底配静态地址** —— 地址/网关/DNS 必须来自
+现场路由器的 DHCP，写死任何 IP 换个网段就废（见下面 5.1）。
+
+### 5.1 插着网卡开机会"卡米"——根因与对策（2026-10-22 定案）
+
+**现象**：只要网卡在通电前就在位，开机约 20 秒时 `system_server` 每 6~7 秒崩一次、无限重启，
+屏幕停在 MI 标（卡米）；把网卡拔掉再开就正常。偶尔又能开过去，看着像"运气"。
+
+**根因**：MIUI 的 `ConnectivityService` 收到以太网的"联网校验完成"消息（`EVENT_NETWORK_TESTED`）
+就去拿 `WifiAssistant.get()`，而 `WifiAssistant` 由 WiFi 栈初始化，要等 `StartWifi` 之后
+**约 1.0~1.2 秒**才存在。以太网这边 DHCP 只要 ~0.7 秒，于是两边抢跑：
+
+```
+java.lang.RuntimeException: WifiAssistant not initialized
+  at com.android.server.WifiAssistant.get(WifiAssistant.java:104)
+  at com.android.server.ConnectivityService$NetworkStateTrackerHandler
+        .maybeHandleNetworkMonitorMessage(ConnectivityService.java:2131)
+```
+
+这台机器的 WCNSS/WiFi 硬件是坏的（`enable_extldo: Platform capability info from CNSS not
+available!` 每 11 秒刷、HAL start/stop 死循环），所以 `WifiAssistant` 的初始化时间点没法规避，
+只能让全网校验**晚到**。
+
+**对策（不用改 /system、不依赖路由器、不靠运气）**：改 Android 自己的以太网配置文件
+`/data/misc/ethernet/ipconfig.txt`（AOSP `IpConfigStore` v2，二进制，`DataOutputStream` 格式）。
+`IpConfiguration` 的**代理**字段和 IP 分配方式是**独立**的，所以可以：
+
+```
+ipAssignment  = DHCP             <- 地址/网关/DNS 全部由现场路由器发，换网段照用
+proxySettings = STATIC
+proxyHost     = 192.0.2.1        <- TEST-NET-1，实测 TCP 静默丢包（无 RST、无 ICMP）
+proxyPort     = 3128
+```
+
+联网校验是**走本网络的代理**去探测的（AOSP `Network.openConnection()` →
+`ConnectivityManager.getProxyForNetwork()`），于是 probe 会一直卡到 `SOCKET_TIMEOUT_MS`：
+
+```
+D NetworkMonitor: PROBE_HTTP http://connect.rom.miui.com/generate_204
+  Probably not a portal: exception java.net.SocketTimeoutException:
+  failed to connect to /192.0.2.1 (port 3128) from /192.168.68.241 (port 49523) after 10000ms
+```
+
+**10 秒 vs 1.2 秒**，竞态余量从 0.2 秒变成 ~9 秒；下次重试还同样卡 10 秒。
+副作用只有"Android 自己上不了网"（它的 HTTP 全走死代理）；sshd / 套壳 Linux / frpc 都是裸 TCP，
+不受影响（实测 `note2ssh0` → 11220 正常登录）。
+
+**写入方法**（幂等，随时可重放）：在 chroot 里跑
+
+```bash
+python3 /root/n2/eth-ipconfig.py          # 生成 + 安装 + chown 1000:1000 + restorecon
+dumpsys ethernet | sed -n '9,13p'         # 期望看到 IP assignment: DHCP / Proxy settings: STATIC
+```
+
+（脚本见 `device/eth-ipconfig.py`，注意它写的是 `/proc/1/root/data/misc/ethernet/`，
+文件 SELinux 标签必须是 `u:object_r:system_data_file:s0`，否则 `system_server` 读不到 → 退回 DHCP。）
+
+**验证要点**：
+- 网卡**不插**开机 → `dumpsys ethernet` 里应显示 `IP assignment: DHCP` + `HTTP proxy: [192.0.2.1] 3128`；
+- 网卡插着开机 → logcat 里必须出现上面那条 `after 10000ms`，且**没有** `WifiAssistant not initialized`；
+- 真要彻底关掉这个补丁：删掉 `/data/misc/ethernet/ipconfig.txt` 重启即可回到纯 DHCP。
 
 > **维护者必读（本轮踩的坑）**：从 chroot 里启动的脚本**必须自己设 `PATH=/system/bin:/system/xbin`**。
 > 否则它会继承 Debian 的 PATH，`cat`/`date`/`ip`/`sleep` 全部 `not found`；
