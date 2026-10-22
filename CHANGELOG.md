@@ -49,6 +49,11 @@ proxySettings = STATIC → 192.0.2.1:3128
 - `n2-pm`：无条件设置 `PATH`（chroot 里 systemd 环境缺 PATH）
 - `device/README.md`：新增 5.1 节（竞态、WifiAssistant、方案与回退）
 
+> **待验证的推测**：这个坑可能只存在于 **WiFi 硬件损坏**的机器上 ——
+> 正常机器开机时 `WifiAssistant` 已就绪，以太网再快也不会抢跑。
+> WiFi 正常但开机时 WiFi 关着的机器是否也会中招，同样未知。
+> 验证方法与结论口径见 `device/README.md` §5.1。
+
 ---
 
 ## v1.1 — 2026-10-21

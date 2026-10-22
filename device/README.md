@@ -348,6 +348,22 @@ dumpsys ethernet | sed -n '9,13p'         # 期望看到 IP assignment: DHCP / P
 - 网卡插着开机 → logcat 里必须出现上面那条 `after 10000ms`，且**没有** `WifiAssistant not initialized`；
 - 真要彻底关掉这个补丁：删掉 `/data/misc/ethernet/ipconfig.txt` 重启即可回到纯 DHCP。
 
+**待验证的推测（2026-10-22 提出，尚未证实）**：这个坑可能**只存在于 WiFi 硬件坏掉的机器**上。
+
+- 依据：`WifiAssistant` 是 WiFi 栈初始化出来的。WiFi 正常的机器开机时 WiFi 服务正常起来，
+  `WifiAssistant` 早就绪，以太网再快也抢不赢，理论上不会崩；
+  而本机 WCNSS/WiFi 是坏的（HAL start/stop 死循环），初始化时间点本身不确定，才把竞态暴露出来。
+- 若成立：**9 台 WiFi 正常的机器不需要这个补丁**，保持 Android 网络可用更好
+  （补丁无害但会牺牲 Android 自身 HTTP）。
+- 边界条件（同样待验证）：WiFi 正常但**开机时 WiFi 是关着的**机器，`WifiAssistant` 会不会也没初始化？
+  如果是，那这个坑就不只属于"坏 WiFi"，而属于"未开 WiFi + 插网卡"。
+- 验证方法（约 10 分钟，任选一台 WiFi 正常的机器）：
+  1. 删掉 `ipconfig.txt` → 插网卡开机 → 看有没有 `WifiAssistant not initialized`。
+     出现了 = 推测不成立，所有插网卡的机器都必须打补丁；
+  2. 同一台机器把 WiFi 关掉 → 插网卡开机 → 看同样日志。出现了 = 边界条件成立；
+  3. 两次都不出现 = 推测成立，补丁只留给 WiFi 坏掉的机器。
+- 当前处理：载荷仍按"所有机器都装"执行（幂等、无害），等到验证结论再收紧。
+
 > **维护者必读（本轮踩的坑）**：从 chroot 里启动的脚本**必须自己设 `PATH=/system/bin:/system/xbin`**。
 > 否则它会继承 Debian 的 PATH，`cat`/`date`/`ip`/`sleep` 全部 `not found`；
 > 其中 `sleep` 找不到 ⇒ 循环变成**裸 `echo` 死循环**，每秒上千次写 USB 模式 knob ⇒
