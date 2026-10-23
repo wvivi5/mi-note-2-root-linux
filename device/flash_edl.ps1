@@ -15,11 +15,19 @@
 #   .\device\flash_edl.ps1 -Wait -Reset          # wait for a 9008 port, flash, reset
 #   .\device\flash_edl.ps1 -Loop -Reset          # one phone after another, until Ctrl+C
 #   .\device\flash_edl.ps1 -ComPort COM3 -Reset
+#   .\device\flash_edl.ps1 -ComPort COM3 -SkipSahara -Reset
+#                                            # firehose already loaded (a previous run
+#                                            # died after "Sahara protocol completed")
 #
 #   -Images <dir>   raw images (rawprogram*.xml, patch*.xml, *.img, firehose .elf)
 #   -Tools  <dir>   MiFlash dir containing fh_loader.exe and QSaharaServer.exe
 #
 # NOTES
+#   * fh_loader NEEDS --search_path (added below).  Without it this build opens the
+#     directory with an empty filename and dies with
+#     "{ERROR: Could not access '<images dir>' with acess mode 'rb'}".
+#   * close MiFlash before flashing: it keeps the 9008 COM port open and the Sahara
+#     upload then fails with "Unable to read packet header. Only read 0 bytes.".
 #   * patch0.xml's NUM_DISK_SECTORS is recomputed at flash time from the phone's own
 #     UFS size, so it also works on a 64 GB unit (the shipped xml assumes less).
 #   * partitions whose <filename> is empty (persist, devinfo, modemst1/2, fsg, fsc,
@@ -37,7 +45,8 @@ param(
     [switch]$Loop,
     [switch]$Reset,
     [switch]$List,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$SkipSahara
 )
 $ErrorActionPreference = 'Stop'
 
@@ -155,20 +164,27 @@ function Flash-One {
     $dev = "\\.\$port"
     Push-Location $Images
     try {
-        Say "uploading firehose: $($elf.Name)"
-        if (-not $DryRun) {
-            & $qsa -p $dev -s "13:$($elf.FullName)"
-            if ($LASTEXITCODE -ne 0) { throw "QSaharaServer failed (exit $LASTEXITCODE)" }
-        } else { Write-Host "    [dry] $qsa -p $dev -s 13:$($elf.FullName)" }
+        if ($SkipSahara) {
+            Warn 'skipping Sahara upload (-SkipSahara): firehose is expected to be already running'
+        } else {
+            Say "uploading firehose: $($elf.Name)"
+            if (-not $DryRun) {
+                & $qsa -p $dev -s "13:$($elf.FullName)"
+                if ($LASTEXITCODE -ne 0) { throw "QSaharaServer failed (exit $LASTEXITCODE)" }
+            } else { Write-Host "    [dry] $qsa -p $dev -s 13:$($elf.FullName)" }
+        }
 
         foreach ($n in $Luns) {
             $xml = "rawprogram$n.xml"; $pat = "patch$n.xml"
             if (-not (Test-Path $xml)) { Write-Host "    LUN ${n}: $xml missing, skipped" -ForegroundColor DarkGray; continue }
             Say "LUN $n : $xml , $pat"
             if (-not $DryRun) {
-                & $fh --port=$dev --sendxml="$xml,$pat" --noprompt --showpercentagecomplete --zlpawarehost=1 --memoryname=ufs
+                # --search_path is REQUIRED: without it fh_loader opens the directory with an
+                # empty filename and dies with "Could not access '<dir>' with acess mode 'rb'"
+                # (cwd alone is not enough in 17.04.27.14.27).
+                & $fh "--port=$dev" "--sendxml=$xml,$pat" "--search_path=$Images" --noprompt --showpercentagecomplete --zlpawarehost=1 --memoryname=ufs
                 if ($LASTEXITCODE -ne 0) { throw "LUN $n failed (exit $LASTEXITCODE)" }
-            } else { Write-Host "    [dry] $fh --port=$dev --sendxml=$xml,$pat" }
+            } else { Write-Host "    [dry] $fh --port=$dev --sendxml=$xml,$pat --search_path=$Images" }
         }
 
         if ($Reset) {

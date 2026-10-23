@@ -742,6 +742,13 @@ strings /proc/last_kmsg | grep -a Power-on      # 上一次开机（关机后仍
 
 - **不需要解 BL**（EDL 走的是 9008 载荷，bootloader 全程锁着）。
 - 需要**短接主板测试点**进 9008，这一步没法脚本化；脚本会等你（`-Wait`）。
+- **刷之前先关掉 MiFlash**：它会一直占着 9008 的 COM 口，Sahara 就会失败
+  （`Unable to read packet header. Only read 0 bytes.`）。
+- Sahara 成功、但写分区失败时（比如 `fh_loader` 报错），firehose 已经跑起来了，
+  加 **`-SkipSahara`** 直接接着写，**不用重新短接**。
+- 脚本给 `fh_loader` 传了 `--search_path`。**这个参数不能省** —— 少了它，
+  `fh_loader` 会用空文件名去开目录，报
+  `{ERROR: Could not access '<images 目录>' with acess mode 'rb'}`。
 - `patch0.xml` 的 `NUM_DISK_SECTORS` 在刷机时按本机真实 UFS 容量重算（64GB 机器也正确）。
 - `persist` / `devinfo` / `modemst1,2` / `fsg` / `fsc` / `keystore` / `frp` 的 `filename` 为空
   ⇒ **不写**，所以 **IMEI、传感器校准、密钥库都保留**（`-List` 里显示成 `(kept as-is)`）。
