@@ -7,6 +7,17 @@ serverPort = 8055
 # frps 暂时连不上时重试而不是退出（0.60+ 默认 true）
 loginFailExit = false
 
+# 高负载保活（2026-10-23 实测：压测时 frpc 心跳被饿死，frps 掐会话 →
+# 日志里 "session shutdown"，隧道掉线）。心跳从 30s 缩到 10s 留足余量。
+transport.heartbeatInterval = 10
+transport.heartbeatTimeout = 90
+# 突发连接（scp+ssh 同时）时 frps 会嫌连接池小，日志刷 "work connection pool is full"
+transport.poolCount = 10
+
+# 本地管理接口：n2frpc 靠它判断“隧道真的通”，而不是只看进程还在
+webServer.addr = "127.0.0.1"
+webServer.port = 7400
+
 auth.method = "token"
 auth.token = "49d69cd1da7d027bbb1ba55ab1eb9caa"
 
@@ -16,3 +27,11 @@ type = "tcp"
 localIP = "127.0.0.1"
 localPort = 8022
 remotePort = 11223
+
+# LLM 测试入口：llama-server 的网页界面 + OpenAI 兼容 API
+[[proxies]]
+name = "note2llm3"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8080
+remotePort = 11283

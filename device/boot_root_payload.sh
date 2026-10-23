@@ -1269,12 +1269,25 @@ for d in /proc/[0-9]*; do
     fi
 done
 say() { echo "$(date) $1" >> $LOG; }
+# Is the tunnel actually alive?  frpc is a child that survives a broken session:
+# under heavy CPU load (all four cores pinned by a local LLM) the heartbeat
+# stalls, frps drops the session, and frpc sits there "running" with a dead
+# tunnel -- pid-based supervision alone never notices.  frpc's admin API tells
+# the truth: a proxy reports "running" only while its work connection is up.
+ADMIN=127.0.0.1/7400
+tunnel_ok() {
+    command -v bash >/dev/null 2>&1 || return 0
+    timeout 8 bash -c "exec 3<>/dev/tcp/$ADMIN || exit 1; printf 'GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3; cat <&3" 2>/dev/null \
+        | grep -q '"status":"running"'
+}
 # frpc logs every failed login, so cap the log ourselves (no logrotate here).
 if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 524288 ]; then
     tail -c 131072 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG"
 fi
 waiting=
 miss=0
+health=0
+tick=0
 backoff=5
 while :; do
     if [ -f "$OFF" ]; then
@@ -1306,15 +1319,36 @@ while :; do
     waiting=no
     if ! pgrep -x frpc >/dev/null 2>&1; then
         say "frpc not running -> starting (server=$server retry in ${backoff}s)"
-        setsid "$FRP" -c "$CONF" >> "$LOG" 2>&1 &
+        # nice -5: frpc must still get a slice while all four cores are pinned by
+        # a local LLM; otherwise its heartbeat stalls and frps drops the session.
+        setsid nice -n -5 "$FRP" -c "$CONF" >> "$LOG" 2>&1 &
         sleep 3
         if pgrep -x frpc >/dev/null 2>&1; then
             miss=0
             backoff=5
+            health=0
         else
             miss=$((miss + 1))
             if [ "$miss" -ge 4 ]; then backoff=60; else backoff=15; fi
             say "frpc exited immediately (attempt $miss) -> not retrying for ${backoff}s"
+        fi
+    else
+        # Probe the admin API every ~30 s, not every loop: each request is
+        # logged by frpc and would otherwise fill the log within a day.
+        tick=$((tick + 1))
+        if [ $((tick % 6)) -eq 0 ]; then
+            if tunnel_ok; then
+                health=0
+            else
+                health=$((health + 1))
+                say "frpc alive but tunnel down (strike $health/3)"
+                if [ "$health" -ge 3 ]; then
+                    say "restarting unresponsive frpc (pid $(pidof frpc))"
+                    pkill -9 -x frpc 2>/dev/null
+                    sleep 2
+                    health=0
+                fi
+            fi
         fi
     fi
     sleep $backoff

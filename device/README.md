@@ -968,6 +968,32 @@ grep -m1 serverAddr /etc/frp/frpc.toml # 确认不是 0.0.0.0
 | #03 | `ea21a39e` | `note2ssh3` | `11223` | `ssh -p 11223 root@168.138.171.141` |
 
 `name` 和 `remotePort` 在 frps 上都是**全局唯一**的。两台填成一样，后连上来的会被 frps 拒绝并把先来的踢掉，表现为"隧道一会儿通一会儿不通"，非常难查 —— 所以每装一台先来这张表里占一行。
+除了 ssh，每台还可以再开一条给 **llama-server** 的隧道（localPort=8080），远端端口从 **11280** 起排：
+
+| 用途 | #3 ea21a39e | A 4bbc97a9 |
+|---|---|---|
+| ssh（8022 -> 远端） | 11223 | 11221 |
+| LLM 网页/API（8080 -> 远端） | 11283 | 11282 |
+
+### 11.5.1 frpc 保活：光看进程不够（2026-10-23 实测）
+
+压测时（四核全被本地 LLM 占满）frpc 的心跳会被饿死，frps 掐掉会话，日志里是
+work connection pool is full → session shutdown；此时 **frpc 进程还活着**，
+只按 pid 判断的 supervisor 永远不会重启它 —— 表现就是"一跑模型隧道就掉"。
+
+现在的 
+2frpc 做三件事：
+1. 
+ice -n -5 启动 frpc（CPU 被占满时也能拿到时间片发心跳）；
+2. 配置里 	ransport.heartbeatInterval = 10（默认 30），留足余量；
+3. 每 30 秒查一次 frpc 自己的管理接口 127.0.0.1:7400/api/status，
+   代理状态不是 unning 就记一次；**连续 3 次**才 pkill -9 frpc 让它重连。
+
+注意 /dev/tcp 的写法是 host/port（斜杠），写成 host:port 会静默失败，
+看门狗会误杀 frpc —— 这个坑踩过一次。
+
+验收（A 机跑 600 token 生成的同时，PC 从公网每 5 秒连一次，持续 4.5 分钟）：
+**35/35 次成功，0 次重连，0 次看门狗触发。**
 
 ```toml
 # 本机(85126a4c)：ssh -p 11220 root@168.138.171.141

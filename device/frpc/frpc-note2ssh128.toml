@@ -1,0 +1,33 @@
+# /etc/frp/frpc.toml —— A 机（4bbc97a9，6+128）
+# 对外：ssh -p 11221 root@168.138.171.141
+
+serverAddr = "168.138.171.141"
+serverPort = 8055
+loginFailExit = false
+
+# 高负载保活（2026-10-23 实测：压测时心跳被饿死 → "session shutdown"）
+transport.heartbeatInterval = 10
+transport.heartbeatTimeout = 90
+transport.poolCount = 10
+
+# 本地管理接口：n2frpc 靠它判断“隧道真的通”
+webServer.addr = "127.0.0.1"
+webServer.port = 7400
+
+auth.method = "token"
+auth.token = "49d69cd1da7d027bbb1ba55ab1eb9caa"
+
+[[proxies]]
+name = "note2ssh128"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8022
+remotePort = 11221
+
+# LLM 测试入口：llama-server 的网页界面 + OpenAI 兼容 API
+[[proxies]]
+name = "note2llm128"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8080
+remotePort = 11282
