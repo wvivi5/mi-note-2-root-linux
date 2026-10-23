@@ -34,6 +34,7 @@ param(
     [switch]$SkipApkInstall,
     [switch]$SkipTermuxPkg,
     [switch]$SkipUi,
+    [switch]$AutostartOnly,
     [switch]$ReinstallTermuxPrefix,
     [switch]$NoReboot,
     [switch]$VerifyOnly,
@@ -122,89 +123,134 @@ function Find-Node { param($Nodes, [string]$Text, [string]$Class)
     return $null
 }
 
+function Clear-AppStopped {
+    # Android does NOT deliver implicit broadcasts - and BOOT_COMPLETED is
+    # implicit - to a package in the "stopped" state.  Two things set that flag:
+    # a fresh install, and MIUI's autostart toggle (it force-stops the app when
+    # you flip the switch).  So this has to run *after* Enable-MiuiAutostart too,
+    # not just after the install.  Launching the app once is the only way to
+    # clear it; a failed launch is silent (the boot hook then simply never runs,
+    # with no error anywhere), so assert the flag instead of trusting the launch.
+    foreach ($p in @('com.termux', 'com.termux.boot')) {
+        $cleared = $false
+        foreach ($k in 1..6) {
+            $st = (((Sh "dumpsys package $p | grep -o 'stopped=[a-z]*'") -join '')).Trim()
+            if ($st -match 'stopped=false') { $cleared = $true; break }
+            Warn "$p is '$st' (stopped apps get no BOOT_COMPLETED) - launching it once"
+            if ($p -eq 'com.termux.boot') { ShOk 'monkey -p com.termux.boot -c android.intent.category.LAUNCHER 1' }
+            else { ShOk 'am start -n com.termux/com.termux.app.TermuxActivity' }
+            Start-Sleep -Seconds 8
+        }
+        if ($cleared) { Ok "$p stopped=false (BOOT_COMPLETED will be delivered)" }
+        else { Warn "$p is still stopped - the boot hook will NOT fire" }
+    }
+}
+
 function Enable-MiuiAutostart {
+    # 9.8.29 (measured 2026-10-23): the global autostart list
+    # (AutoStartManagementActivity) is a dead end - it only ever shows the ~9
+    # preinstalled apps and its "more" button is a no-op, so Termux and
+    # Termux:Boot never show up there.  The per-app switch on the app details
+    # page does work and survives reboots:
+    #   am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:<pkg>
+    #   tap  com.miui.securitycenter:id/am_switch
+    #   confirm the "turn on autostart?" dialog (right-hand button)
+    # Without this the framework refuses the boot broadcast:
+    #   BroadcastQueueInjector: Unable to launch app com.termux.boot/... for
+    #   broadcast BOOT_COMPLETED: process is not permitted to auto start
+    # and neither 8022 nor 8023 ever comes up.
+    # Do NOT use `appops set <pkg> 10008 allow` instead: it reads back as
+    # "allow" but MIUI wipes it on the next boot (verified).
+    #
+    # Two traps, both measured here:
+    #   * ApplicationsDetailsActivity is a reused instance: starting it for a
+    #     second package without leaving the page first just brings the *old*
+    #     page to the front ("Activity not started"), so the switch you read
+    #     belongs to the previous package.  Hence the back-out + label check.
+    #   * the dialog labels were mojibake in an earlier revision of this file,
+    #     so the confirm button is matched by code point, not by literal text.
+    # Keep this block ASCII-only.
+    $okText = [string][char]0x786E + [char]0x5B9A        # confirm button
+
+    $targets = @(
+        @{ Pkg = 'com.termux.boot'; Label = 'Termux:Boot' },
+        @{ Pkg = 'com.termux';      Label = 'Termux'      }
+    )
+
     Info 'waking the screen (taps do nothing while the keyguard is up)'
     ShOk 'input keyevent KEYCODE_WAKEUP'
     ShOk 'input keyevent 82'
     Start-Sleep -Seconds 2
-    Info 'opening MIUI autostart list'
-    ShOk 'am start -n com.miui.securitycenter/com.miui.permcenter.autostart.AutoStartManagementActivity'
-    Start-Sleep -Seconds 5
 
-    # some MIUI builds show a confirmation dialog first
-    foreach ($round in 1..3) {
-        $nodes = Get-Nodes
-        $hit = $null
-        foreach ($n in $nodes) {
-            $t = ('' + $n.text).Trim()
-            if ($t -eq '纭畾' -or $t -eq 'OK' -or $t -eq '鍚屾剰') { $hit = $n; break }
-        }
-        if (-not $hit) { break }
-        $b = Get-Bounds ('' + $hit.bounds)
-        if ($b) { Info "dismissing dialog ($($hit.text))"; Tap ([int](($b[0] + $b[2]) / 2)) ([int](($b[1] + $b[3]) / 2)) }
-    }
-
-    $rim = Sh 'wm size'
-    $screenW = 1080
-    if ($rim -match '(\d+)x(\d+)') { $screenW = [int]$Matches[1] }
-    Info "screen width = $screenW"
-
-    foreach ($target in @('Termux:Boot', 'Termux')) {
+    foreach ($t in $targets) {
+        $pkg = $t.Pkg
         $done = $false
-        foreach ($attempt in 1..8) {
+        foreach ($attempt in 1..4) {
+            # leave a stale details page (see the trap above)
+            foreach ($i in 1..3) {
+                $focus = (Sh 'dumpsys window | grep -m1 mCurrentFocus') -join ' '
+                if ($focus -notmatch 'ApplicationsDetailsActivity') { break }
+                ShOk 'input keyevent 4'
+                Start-Sleep -Milliseconds 1200
+            }
+            ShOk "am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:$pkg"
+            Start-Sleep -Seconds 3
             $nodes = Get-Nodes
-            # the row label
-            $label = $null
-            foreach ($n in $nodes) { if (('' + $n.text).Trim() -eq $target) { $label = $n; break } }
-            if (-not $label) {
-                if ($attempt -lt 8) { ShOk 'input swipe 540 1600 540 800 300'; Start-Sleep -Milliseconds 1200 }
-                continue
-            }
-            $lb = Get-Bounds ('' + $label.bounds)
-            if (-not $lb) { continue }
-            $ly = [int](($lb[1] + $lb[3]) / 2)
-            # the checkbox/switch on the same row (closest y-center)
-            $best = $null; $bestd = 99999
+            $label = ''
             foreach ($n in $nodes) {
-                $c = '' + $n.class
-                if ($c -notmatch 'CheckBox|Switch|Checkable') { continue }
-                $cb = Get-Bounds ('' + $n.bounds)
-                if (-not $cb) { continue }
-                $cy = [int](($cb[1] + $cb[3]) / 2)
-                $d = [math]::Abs($cy - $ly)
-                if ($d -lt $bestd) { $bestd = $d; $best = $n }
+                if (('' + $n.'resource-id') -match 'app_manager_details_applabel') { $label = ('' + $n.text).Trim(); break }
             }
-            if (-not $best -or $bestd -gt 60) {
-                Info "$target : label found but no switch on that row (y=$ly)"
-                if ($attempt -lt 8) { ShOk 'input swipe 540 1600 540 800 300'; Start-Sleep -Milliseconds 1200 }
+            if ($label -ne $t.Label) {
+                Warn "$pkg : details page shows '$label', expected '$($t.Label)' (attempt $attempt)"
                 continue
             }
-            $cb = Get-Bounds ('' + $best.bounds)
-            $cx = [int](($cb[0] + $cb[2]) / 2); $cy2 = [int](($cb[1] + $cb[3]) / 2)
-            if (('' + $best.checked) -eq 'true') {
-                Ok "$target already allowed"
-                $done = $true; break
+
+            # a confirmation dialog left over from the previous attempt
+            $stale = $null
+            foreach ($n in $nodes) { if (('' + $n.text).Trim() -eq $okText) { $stale = $n; break } }
+            if ($stale) {
+                $sb = Get-Bounds ('' + $stale.bounds)
+                if ($sb) { Tap ([int](($sb[0] + $sb[2]) / 2)) ([int](($sb[1] + $sb[3]) / 2)); Start-Sleep -Seconds 2 }
+                $nodes = Get-Nodes
             }
-            Info "$target : tapping switch at ($cx,$cy2)"
-            Tap $cx $cy2
+
+            $sw = $null
+            foreach ($n in $nodes) { if (('' + $n.'resource-id') -match 'am_switch') { $sw = $n; break } }
+            if (-not $sw) { Warn "$pkg : no autostart switch on the details page (attempt $attempt)"; continue }
+            if (('' + $sw.checked) -eq 'true') { Ok "$pkg autostart already on"; $done = $true; break }
+
+            $b = Get-Bounds ('' + $sw.bounds)
+            if (-not $b) { continue }
+            Info "$pkg : tapping the autostart switch"
+            Tap ([int](($b[0] + $b[2]) / 2)) ([int](($b[1] + $b[3]) / 2))
             Start-Sleep -Seconds 2
-            $nodes2 = Get-Nodes
-            $best2 = $null; $bestd2 = 99999
-            foreach ($n in $nodes2) {
-                $c = '' + $n.class
-                if ($c -notmatch 'CheckBox|Switch|Checkable') { continue }
-                $cb2 = Get-Bounds ('' + $n.bounds)
-                if (-not $cb2) { continue }
-                $cyy = [int](($cb2[1] + $cb2[3]) / 2)
-                $dd = [math]::Abs($cyy - $ly)
-                if ($dd -lt $bestd2) { $bestd2 = $dd; $best2 = $n }
+
+            foreach ($n in (Get-Nodes)) {
+                if (('' + $n.text).Trim() -eq $okText) {
+                    $b2 = Get-Bounds ('' + $n.bounds)
+                    if ($b2) { Tap ([int](($b2[0] + $b2[2]) / 2)) ([int](($b2[1] + $b2[3]) / 2)) }
+                    break
+                }
             }
-            if ($best2 -and ('' + $best2.checked) -eq 'true') { Ok "$target enabled"; $done = $true; break }
-            Warn "$target still not checked after tap"
-            break
+            Start-Sleep -Seconds 1
+
+            foreach ($n in (Get-Nodes)) {
+                if (('' + $n.'resource-id') -match 'am_switch') {
+                    if (('' + $n.checked) -eq 'true') { Ok "$pkg autostart enabled ($label)"; $done = $true }
+                    break
+                }
+            }
+            if ($done) { break }
+            Warn "$pkg : switch still off after tap"
         }
-        if (-not $done) { Warn "could not confirm autostart for $target - check manually" }
+        if (-not $done) {
+            Warn "could not enable autostart for $pkg - turn it on by hand (app details page) or the boot chain will stay dead"
+        }
     }
+
+    # Flipping the switch force-stops the app, and a stopped app never sees
+    # BOOT_COMPLETED, so clear the flag again now that the switches are on.
+    Clear-AppStopped
 }
 
 function Test-SshPort { param([int]$Port, [string]$User, [string]$Expect, [string]$LocalPort)
@@ -264,6 +310,18 @@ if ($kv -match '-perf-ga01336f') {
          "           (b) re-run with -ForceKernel if you accept the risk.")
 }
 
+if ($AutostartOnly) {
+    # For a phone whose boot chain stays dead: the only missing piece is usually
+    # this switch, so re-run it without touching the root/chroot install.
+    Say 'MIUI autostart (only)'
+    Enable-MiuiAutostart
+    Info 'whitelisting from battery optimisation (best effort)'
+    ShOk 'dumpsys deviceidle whitelist +com.termux'
+    ShOk 'dumpsys deviceidle whitelist +com.termux.boot'
+    Say 'done'
+    exit 0
+}
+
 if ($VerifyOnly) {
     Say 'verify (ports + ssh)'
 } else {
@@ -284,6 +342,16 @@ function Install-Apk([string]$apk, [string]$pkg) {
     $o = A install -r -g $apk
     $s = ($o -join "`n")
     if ($s -match 'Success') { return $true }
+    # Some MIUI builds reject -g outright: "You need the
+    # android.permission.INSTALL_GRANT_RUNTIME_PERMISSIONS permission to use the
+    # PackageManager.INSTALL_GRANT_RUNTIME_PERMISSIONS flag".  shell (uid 2000) has no
+    # such permission, so retry without -g before giving up on adb install.
+    if ($s -match 'INSTALL_GRANT_RUNTIME_PERMISSIONS') {
+        Warn 'this ROM rejects -g (INSTALL_GRANT_RUNTIME_PERMISSIONS) -> retrying without -g'
+        $o = A install -r $apk
+        $s = ($o -join "`n")
+        if ($s -match 'Success') { return $true }
+    }
     if ($s -notmatch 'USER_RESTRICTED|canceled by user') {
         Warn "adb install failed: $($s.Trim())"
         return $false
@@ -321,23 +389,8 @@ Start-Sleep -Seconds 6
 
 # Android does NOT deliver implicit broadcasts - and BOOT_COMPLETED is implicit -
 # to a package in the "stopped" state, and a freshly installed package IS stopped.
-# The only way to clear it is to launch the app once.  A failed launch is silent
-# (the hook then simply never runs, with no error anywhere), so assert the flag
-# instead of assuming it.  NB: `am force-stop` does not set it back, but do not
-# force-stop these two anyway - leave them alone until the reboot.
-foreach ($p in @('com.termux', 'com.termux.boot')) {
-    $cleared = $false
-    foreach ($k in 1..6) {
-        $st = (((Sh "dumpsys package $p | grep -o 'stopped=[a-z]*'") -join '')).Trim()
-        if ($st -match 'stopped=false') { $cleared = $true; break }
-        Warn "$p is '$st' (stopped apps get no BOOT_COMPLETED) - launching it once"
-        if ($p -eq 'com.termux.boot') { ShOk 'monkey -p com.termux.boot -c android.intent.category.LAUNCHER 1' }
-        else { ShOk 'am start -n com.termux/com.termux.app.TermuxActivity' }
-        Start-Sleep -Seconds 8
-    }
-    if ($cleared) { Ok "$p stopped=false (BOOT_COMPLETED will be delivered)" }
-    else { Warn "$p is still stopped - the boot hook will NOT fire" }
-}
+# Clear it now, and again after the MIUI autostart step (that toggle re-stops them).
+Clear-AppStopped
 
 # The app uid, from the *package manager* (authoritative).  The owner of the data
 # dir can be stale after a reinstall: PMS may hand out a new shared-user id, and

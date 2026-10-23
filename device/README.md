@@ -58,11 +58,13 @@ powershell -ExecutionPolicy Bypass -File .\device\provision.ps1 -Serial <SN>
 
 1. 装 **Termux** + **Termux:Boot**（未装才装；MIUI 会拒绝 `adb install`，
    自动降级走**安装器 UI**，见下）
-2. 各启动一次，并**断言 `stopped=false`**（见 §6 的坑；stopped 的包收不到开机广播）
+2. 各启动一次，并**断言 `stopped=false`**（见 §6 的坑；stopped 的包收不到开机广播）——
+   第 6 步开完自启动后还要**再清一次**，因为 MIUI 的开关本身会 force-stop 应用
 3. 推送 staging 区 `/data/local/tmp/n2stage`（含 112 MB 的 Ubuntu rootfs 模板 + 70 MB 的 Termux bootstrap）
 4. 跑 CVE-2019-2215 拿 root → `p1.sh`：解包 Termux bootstrap、安装开机钩子、起后台任务
 5. `p2wrap.sh` 后台以 App 身份 `pkg install openssh`（→ 8023），完事 `restorecon` 修标签
-6. UI 自动化打开 MIUI「自启动」白名单（Termux / Termux:Boot）
+6. UI 自动化打开 MIUI「自启动」白名单（Termux / Termux:Boot）——**只能走"应用详情页"里的开关**，
+   全局「自启动管理」列表里根本没有 Termux（见 §6）
 7. `adb reboot`，然后**功能性验证**（adb forward + 真的 ssh 登录一次）
 
 ### 参数
@@ -75,6 +77,7 @@ powershell -ExecutionPolicy Bypass -File .\device\provision.ps1 -Serial <SN>
 | `-SkipApkInstall` | APK 已装，跳过安装 |
 | `-SkipTermuxPkg` | 跳过 `pkg install openssh`（不要 8023 救援通道时） |
 | `-SkipUi` | 跳过 MIUI 自启动 UI 自动化（自己手开） |
+| `-AutostartOnly` | 只重做 MIUI 自启动 + 清 `stopped`，不动 root/chroot（开机链不通时先跑这个） |
 | `-NoReboot` | 不重启（只在写文件、不验证开机链时用） |
 | `-VerifyOnly` | 只验证当前状态，不改动任何东西 |
 | `-ReinstallTermuxPrefix` | 清 marker，强制重解包 Termux bootstrap |
@@ -626,9 +629,22 @@ strings /proc/last_kmsg | grep -a Power-on      # 上一次开机（关机后仍
 - **chroot 里必须显式设 PATH**（`env -i PATH=...`），否则继承 Android 的 PATH，`apt-get: not found`。
 - **arm64 → 必须用 `/ubuntu-ports/`** 源；apt 还要 `APT::Sandbox::User "root"`。
 - **`stopped=true` 的包收不到开机广播**（BOOT_COMPLETED 是隐式广播，Android 不给 stopped 的包发）。
-  新装的 APK 默认就是 stopped，解法是**启动一次**；`am force-stop` 不会把它置回去。这一条没有任何
-  报错、界面上也看不出来 —— 所以 `provision.ps1` 会**断言并重试** `dumpsys package <pkg> | grep stopped=`，
-  不满足就现场 launch，仍不满足就明确警告。
+  新装的 APK 默认就是 stopped，解法是**启动一次**。这一条没有任何报错、界面上也看不出来 ——
+  所以 `provision.ps1` 会**断言并重试** `dumpsys package <pkg> | grep stopped=`，不满足就现场 launch。
+- **MIUI 的自启动开关本身会 force-stop 应用**（2026-10-23 实测）。所以"装完拉一次 → 断言 stopped=false
+  → 再去开自启动"的顺序是错的：开关一拨，两个包又回到 `stopped=true`，开机时 **连广播都不进队列**
+  （logcat 里连 `not permitted to auto start` 都没有），8022/8023 全不通。正确顺序是
+  **开完开关之后再清一次 stopped**，`Enable-MiuiAutostart` 末尾已经调 `Clear-AppStopped`。
+- **MIUI 10 的「自启动」只能按应用开，不能按列表开**：全局的自启动管理列表
+  （`AutoStartManagementActivity`）只列预装的 9 个应用，「更多」是个死按钮（点了没反应、列表不滚），
+  Termux 永远不出现。`appops set <pkg> 10008 allow` 读回来是 `allow`，但**下次开机被 MIUI 清掉**（实测
+  两次）。可靠路径是应用详情页：
+  `am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:<pkg>` → 点
+  `com.miui.securitycenter:id/am_switch` → 二次确认框「开启自启动后…」点右边的**确定**。
+  两个坑：① `ApplicationsDetailsActivity` 是**复用实例**，不先退出去就 `am start` 第二个包，页面不会换
+  （只打印 `Activity not started`），你读到的是**上一个包**的开关状态 —— 所以脚本会先按 BACK 退出、再
+  校验页面标题（`app_manager_details_applabel`）确实是目标包；② 确认框按钮**按 resource-id / 码点匹配，
+  不要按中文文本匹配**（这份脚本曾经因为中文被读成乱码而永远匹配不上 `确定`）。
 - **MIUI 拒绝 `adb install`**：报 `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user`。
   根因是 MIUI 把 adb 安装改派给 `com.miui.securitycenter/.permcenter.install.AdbInstallActivity`
   做"用户确认"，而它要小米账号授权 USB 安装、否则 **50 毫秒内自己取消**（没有框可点）。
@@ -686,7 +702,7 @@ strings /proc/last_kmsg | grep -a Power-on      # 上一次开机（关机后仍
 | logcat 有 `I/termux: No files to execute at boot`，但没有 avc denial | App **看不见**自己的 `$HOME`：查 `dumpsys package com.termux \| grep uid` 与 `stat -c %u /data/data/com.termux` 是否一致。不一致就重跑 `provision.ps1`（会写 `.appuid` 并让 p1 重新 chown），或手工 root `chown -R <uid>:<uid> /data/data/com.termux/files /data/data/com.termux` |
 | logcat 有 `Cannot run program ".../00-startup.sh" ... error=13` | Termux prefix 被 wipe 但 staging 的 `.prefix_ok` 还在 → 重跑 `provision.ps1 -ReinstallTermuxPrefix`（或删 `.prefix_ok`）；新版 p1 已能自愈 |
 | `adb install` 报 `INSTALL_FAILED_USER_RESTRICTED` | 正常现象，MIUI 拦 adb 安装。`provision.ps1` 会自动降级到 `install_apks.ps1`（需要**屏幕解锁**）；也可手工在开发者选项里打开"USB 安装"（要登录小米账号） |
-| MIUI 自启动没开上 | 脚本用 `uiautomator dump` + 点击，锁屏/PIN 会导致失败 → 解锁后重跑 `provision.ps1 -SkipApkInstall` |
+| MIUI 自启动没开上 | ① 先跑 `provision.ps1 -AutostartOnly`（走应用详情页开关，并清 `stopped`）；② 确认 `dumpsys package com.termux.boot \| grep stopped=` 是 `false`；③ `logcat -d \| grep "not permitted to  auto start"` 里出现 `com.termux.boot` = 开关没生效；④ 锁屏/PIN 会让 UI 自动化点不到，先解锁 |
 | 想完全重置这台机器 | `adb shell pm clear com.termux`，然后 `adb shell rm -rf /data/local/tmp/n2stage`，再跑一遍 `provision.ps1` |
 | ssh 突然掉线、8022 连不上（手机还开着） | 先等 20 秒再试：看门狗（15 秒一轮）会自动把 sshd 拉起来。进去看 `/var/log/n2watch.log` 有没有 `sshd not listening -> starting it` |
 | 想让某台"重启一次就全回来" | 直接 `adb reboot`。整条链模拟了"进程被杀光"的极端情况，重启即恢复 |
@@ -713,7 +729,7 @@ strings /proc/last_kmsg | grep -a Power-on      # 上一次开机（关机后仍
 | 解密卡住时想从 adb 救 | `adb` 在这个阶段**是可用的**（比 ssh/Termux 早得多）：`adb shell getprop vold.decrypt` 确认，然后 `adb reboot`。**绝不要在密码界面反复试密码** —— `cryptfs_hw.c` 里写死了：连续试错到上限，硬件会**直接擦除整个 userdata 分区**（`ERR_MAX_PASSWORD_ATTEMPTS → vold wipe userdata`） |
 | **现场停电后，有的机器停在"输入锁屏密码"没人管** | 根因是**冷启动的时序竞争**：vold 向 TrustZone 申请硬件密钥时 TZ 服务还没起来（`ioctl create encryption key for usage 3 failed ... errno=22`），属偶发，**热重启必成**。设备侧改不了（/system 只读 + dm-verity，动不了 init/vold 的时序），所以把救活交给 PC：现场 PC 上常驻跑 `device\fde-watchdog.bat`，它每 30 秒查一次 USB 上的手机，发现 `vold.decrypt` 卡在 `trigger_restart_min_framework` 超过 90 秒就下发一次 `adb reboot`，并在 1 小时内最多重试 3 次（超过就只报警，那是电池/充电器的问题）。**注意这台机器必须自己再验证**：`fde-test.ps1 -Cycles 4` 会反复断电→等 RTC 闹钟叫醒→记录解密结果到 `results.csv`，用它统计失败率。另外看门狗加 `-LanFile fleet.txt` 能顺带盯住局域网机器 —— 有的机器**根本没开机回来**（不是解密卡住），这种情况 adb 无能为力，但至少要有人立刻知道 |
 | 用 `pm disable-user` 精简，重启后**自己恢复了** | 这台 MIUI 会在开机时把用户禁用的包改回默认态，而且是**选择性**的：同一次重启里，`systemAdSolution/analytics/hybrid/joyose/weather2` 5 个保留住了，`player/video/newhome/voiceassist/搜狗输入法/daemon/gamecenter/scanner/compass` 等 18 个全被改回启用。实测禁用后不重启 3 分钟纹丝不动，一重启就变 —— 所以**disable 不可靠，精简一律用 `pm uninstall --user 0`**。判据：重启前后各跑一次 `pm list packages -d` 对比 |
-| 卸载成功（pm 回 Success）但**包数没少，或者少了下次又回来** | MIUI 有一份"必须存在"的应用名单，会在开机时把名单内的包**重新装回 user 0**。30 个候选实测：**17 个被装回、13 个稳定移除**。装回的：`player/video/newhome/voiceassist/搜狗输入法/daemon/gamecenter(+sdk.service)/scanner/compass/browser/translationservice/userguide/egg/hybrid.accessory/translation.xmcloud/translation.youdao`。稳定移除的：`screenrecorder/touchassistant/vipaccount/smarttravel/drivemode/health/dlabs.vr/bugreport/systemAdSolution/hybrid/joyose/analytics/weather2`。**唯一可信判据是重启后 `cmd package list packages` 回查**，pm 的返回值不算数。**而且这份名单是逐台不同的**：同一 ROM（9.8.29）、同一条命令、同一个脚本，在 `4bbc97a9` 上 13 个稳定移除，在 `85126a4c` 上 12 个**每次**都被装回（只有 `screenrecorder` 留下，连做两轮卸载→重启也一样）。别把某一台的结果当成通用名单，每台上机都要自己验一次 |
+| 卸载成功（pm 回 Success）但**包数没少，或者少了下次又回来** | MIUI 有一份"必须存在"的应用名单，会在开机时把名单内的包**重新装回 user 0**。30 个候选实测：**17 个被装回、13 个稳定移除**。装回的：`player/video/newhome/voiceassist/搜狗输入法/daemon/gamecenter(+sdk.service)/scanner/compass/browser/translationservice/userguide/egg/hybrid.accessory/translation.xmcloud/translation.youdao`。稳定移除的：`screenrecorder/touchassistant/vipaccount/smarttravel/drivemode/health/dlabs.vr/bugreport/systemAdSolution/hybrid/joyose/analytics/weather2`。**唯一可信判据是重启后 `cmd package list packages` 回查**，pm 的返回值不算数。**而且这份名单是逐台不同的**：同一 ROM（9.8.29）、同一条命令、同一个脚本，在 `4bbc97a9` 上 13 个稳定移除，在 `85126a4c` 上 12 个**每次**都被装回（只有 `screenrecorder` 留下，连做两轮卸载→重启也一样）。别把某一台的结果当成通用名单，每台上机都要自己验一次。2026-10-23 又测一台（`ea21a39e`，这台**登录了小米账号**）：6 个批次跑完 **0 个**留下来，全被装回（239 → 239 包）。怀疑与"登录小米账号 / 云同步"有关，但只有一台样本，先记现象 |
 | 卸载被装回、`disable-user` 也被撤销 —— **能不能改用 `pm hide`？不能** | hide 的 `hidden="true"` 确实扛得过重启（`85126a4c` 实测 14/14），看起来是答案，但它**每次开机都会崩 system_server**：MIUI 的 `SecurityManagerService.checkEnabled()` 在 `boot_completed` **之前**就遍历隐藏包，调 `SecurityManagerCompat.checkAppHidden()` → `setApplicationHiddenSettingAsUser()` → `PackageManagerService.sendSessionCommitBroadcast()`，而 AMS 拒绝在开机完成前发广播 → `IllegalStateException: Cannot broadcast before boot completed` → `*** FATAL EXCEPTION IN SYSTEM PROCESS: Thread-3 ***`。实测藏 30 个包时开机崩了 2 次（21:14:35 / 21:14:41），MIUI 趁这空档反隐藏了 2 个包，手机靠 system_server 自杀重启才走到 `boot_completed` —— 再差一点就是卡 MI。**所以这类机器只能卸 `/data/app` 的第三方预装**（`pm uninstall --user 0` 对它们有效、MIUI 也不管；6 个里 4 个成功、腾出 235 MB，另外 2 个回 `Failure [-1000]`），MIUI 要护着的系统包在改不了 /system 的前提下动不了。`n2-hide` 保留但执行隐藏必须加 `-f`，只用于在别的机器上复现这个崩溃 |
 | **为什么同一 ROM 两台机器行为相反**（这台卸载无效、那台有效） | 没查到 MIUI 内部的判定依据（不是时钟：校准后照样装回；不是 ROM：`packages.xml` 头部、`ro.miui.*` 属性、`preinstall.list` 全一致；不是"第一次/第二次"：连做两轮一样；也不是"整批触发"：单包也装回）。唯一可行的做法是**每台上机实测**：`pm uninstall` 一批 → 重启 → 回查，把结果记下来；不要拿别的机器的名单套用 |
 | 精简**省不了存储空间**（只省内存） | `pm uninstall --user 0` 只改 user 0 的安装状态，**APK 还留在只读的 /system 分区**（`/dev/block/dm-0`，dm-verity 保护），空间不回收。真正省空间的只有 `/data/app` 下的预装第三方（美团/百度地图/有品等 11 个，那批已经永久移除）。所以精简的价值全在**运行内存**：稳定移除的那 13 个里，常驻的 5 个（systemAdSolution×2 进程、hybrid、joyose、analytics、weather2）约 **69 MB PSS** 不会再回来 |
