@@ -1,0 +1,35 @@
+# 新机器默认模板（2026-10-23 起）
+#
+# 用法：复制成 /etc/frp/frpc.toml，只改下面三处：
+#   1) name        按 device/README.md §11.5 命名表占一行（全局唯一）
+#   2) remotePort  同上表，全局唯一
+#   3) 其他都别动 —— 保活参数已经在这儿，删掉就等于退回"高负载必掉线"的老版本
+#
+# 检查：sh -n /root/n2frpc && pgrep -a n2frpc
+# 验收：从外部 ssh -p <remotePort> root@168.138.171.141 能进，且
+#       /var/log/frpc.log 里没有 "tunnel down" 连续三次
+
+serverAddr = "168.138.171.141"
+serverPort = 8055
+# frps 连不上时重试而不是退出（0.60+ 默认 true，会直接退出）
+loginFailExit = false
+
+# 高负载保活：四核被本地 LLM 占满时，默认 30s 心跳会被饿死 → frps 掐会话
+transport.heartbeatInterval = 10
+transport.heartbeatTimeout = 90
+# 突发连接（scp+ssh 同时）时 frps 会刷 "work connection pool is full"
+transport.poolCount = 10
+
+# 本地管理接口：n2frpc 每 30s 查一次，代理不是 running 连续 3 次就重启 frpc
+webServer.addr = "127.0.0.1"
+webServer.port = 7400
+
+auth.method = "token"
+auth.token = "49d69cd1da7d027bbb1ba55ab1eb9caa"
+
+[[proxies]]
+name = "CHANGE-ME"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8022
+remotePort = 0
