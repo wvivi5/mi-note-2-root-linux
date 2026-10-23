@@ -1,0 +1,18 @@
+# /etc/frp/frpc.toml —— 第 03 台（ea21a39e，4+64，WiFi 正常）
+# 对外：ssh -p 11223 root@168.138.171.141
+# 隧道名和 remotePort 在 frps 上全局唯一，见 device/README.md §11.5
+
+serverAddr = "168.138.171.141"
+serverPort = 8055
+# frps 暂时连不上时重试而不是退出（0.60+ 默认 true）
+loginFailExit = false
+
+auth.method = "token"
+auth.token = "49d69cd1da7d027bbb1ba55ab1eb9caa"
+
+[[proxies]]
+name = "note2ssh3"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8022
+remotePort = 11223
